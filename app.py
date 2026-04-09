@@ -41,6 +41,32 @@ except ImportError:
     except Exception:
         PYDUB_OK = False
 
+try:
+    from pyzbar import pyzbar as _pyzbar
+    PYZBAR_OK = True
+except ImportError:
+    try:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "pyzbar", "-q"])
+        from pyzbar import pyzbar as _pyzbar
+        PYZBAR_OK = True
+    except Exception:
+        PYZBAR_OK = False
+
+try:
+    import qrcode as _qrcode
+    QRCODE_OK = True
+except ImportError:
+    try:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "qrcode[pil]", "-q"])
+        import qrcode as _qrcode
+        QRCODE_OK = True
+    except Exception:
+        QRCODE_OK = False
+
+import base64
+
 # ── Conversion core ───────────────────────────────────────────────────────────
 
 _QUARTER = [
@@ -603,6 +629,57 @@ def _codes_to_css(codes):
     return ";".join(styles)
 
 
+# ── QR Code routes ───────────────────────────────────────────────────────────
+
+@app.route("/qr-check", methods=["GET"])
+def qr_check():
+    return jsonify({"pyzbar": PYZBAR_OK, "qrcode": QRCODE_OK})
+
+
+@app.route("/qr-scan", methods=["POST"])
+def qr_scan():
+    if not PYZBAR_OK:
+        return jsonify({"error": "需要安装 pyzbar：pip install pyzbar"}), 400
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "未上传文件"}), 400
+    try:
+        img = Image.open(file.stream).convert("RGB")
+        decoded = _pyzbar.decode(img)
+        if not decoded:
+            return jsonify({"error": "未检测到二维码或条形码"}), 400
+        results = []
+        for obj in decoded:
+            results.append({
+                "type": obj.type,
+                "data": obj.data.decode("utf-8", errors="replace"),
+            })
+        return jsonify({"results": results})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/qr-generate", methods=["POST"])
+def qr_generate():
+    if not QRCODE_OK:
+        return jsonify({"error": "需要安装 qrcode：pip install qrcode[pil]"}), 400
+    body = request.get_json(silent=True) or {}
+    text = body.get("text", "").strip()
+    if not text:
+        return jsonify({"error": "内容为空"}), 400
+    try:
+        qr = _qrcode.QRCode(error_correction=_qrcode.constants.ERROR_CORRECT_M)
+        qr.add_data(text)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return jsonify({"image": f"data:image/png;base64,{b64}"})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 # ── Embedded HTML ─────────────────────────────────────────────────────────────
 
 _HTML = r"""<!DOCTYPE html>
@@ -755,6 +832,30 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
 .bili-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);text-align:center}
 .bili-placeholder-icon{font-size:3rem;opacity:.3}
 @media(max-width:700px){.bili-container{grid-template-columns:1fr;grid-template-rows:auto 1fr}.bili-sidebar{border-right:none;border-bottom:1px solid var(--border)}}
+/* ── QR Code ── */
+.qr-container{display:grid;grid-template-columns:300px 1fr;flex:1;overflow:hidden}
+.qr-sidebar{border-right:1px solid var(--border);padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+.qr-main{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px;overflow:auto;background:var(--bg);gap:20px}
+.qr-mode-tabs{display:flex;border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.qr-mode-tabs input[type=radio]{display:none}
+.qr-mode-tabs label{flex:1;text-align:center;padding:8px;font-size:.82rem;font-weight:600;cursor:pointer;color:var(--muted);transition:background .15s,color .15s}
+.qr-mode-tabs input[type=radio]:checked+label{background:var(--accent);color:#000}
+.qr-result-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;width:100%;max-width:520px}
+.qr-result-card h3{font-size:.9rem;font-weight:600;margin-bottom:12px;color:var(--muted)}
+.qr-result-item{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:8px}
+.qr-result-item:last-child{margin-bottom:0}
+.qr-type-badge{display:inline-block;font-size:.65rem;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba(88,166,255,.15);color:var(--accent);margin-bottom:6px}
+.qr-data{font-family:monospace;font-size:.85rem;word-break:break-all;color:var(--text)}
+.qr-data a{color:var(--accent);text-decoration:none}
+.qr-data a:hover{text-decoration:underline}
+.qr-copy-row{display:flex;gap:6px;margin-top:8px}
+.qr-img-wrap{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;text-align:center}
+.qr-img-wrap img{max-width:300px;width:100%;image-rendering:pixelated;border-radius:4px}
+.qr-gen-textarea{width:100%;height:100px;padding:8px 10px;border-radius:var(--r);background:var(--surface);color:var(--text);border:1px solid var(--border);font-size:.85rem;resize:vertical;outline:none;font-family:inherit}
+.qr-gen-textarea:focus{border-color:var(--accent)}
+.qr-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);text-align:center}
+.qr-placeholder-icon{font-size:3rem;opacity:.3}
+@media(max-width:700px){.qr-container{grid-template-columns:1fr;grid-template-rows:auto 1fr}.qr-sidebar{border-right:none;border-bottom:1px solid var(--border)}}
 </style>
 </head>
 <body>
@@ -767,9 +868,10 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
       <button class="nav-tab" data-tab="picker">🎨 吸管工具</button>
       <button class="nav-tab" data-tab="audio">🎵 音频转换</button>
       <button class="nav-tab" data-tab="bili">📺 B站下载</button>
+      <button class="nav-tab" data-tab="qr">📷 二维码</button>
     </nav>
   </div>
-  <span class="badge">v2.3</span>
+  <span class="badge">v2.4</span>
 </header>
 
 <!-- ASCII Art Module -->
@@ -1114,6 +1216,59 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
           <div class="bili-meta" id="bili-meta"></div>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- QR Code Module -->
+<div id="module-qr" class="module">
+  <div class="module-header">
+    <h2>📷 二维码工具</h2>
+    <p class="module-desc">扫描识别二维码 / 条形码，或生成自定义二维码</p>
+  </div>
+  <div class="qr-container">
+    <div class="qr-sidebar">
+      <section>
+        <p class="sec-title">模式</p>
+        <div class="qr-mode-tabs">
+          <input type="radio" name="qr-mode" id="qr-mode-scan" value="scan" checked/>
+          <label for="qr-mode-scan">📷 扫描</label>
+          <input type="radio" name="qr-mode" id="qr-mode-gen" value="gen"/>
+          <label for="qr-mode-gen">✨ 生成</label>
+        </div>
+      </section>
+      <!-- Scan panel -->
+      <section id="qr-scan-panel">
+        <p class="sec-title">上传图片</p>
+        <div class="drop-zone" id="qr-drop-zone">
+          <input type="file" id="qr-file-input" accept="image/*"/>
+          <div class="drop-icon">📷</div>
+          <p class="drop-label">拖放图片到此处<br>或 <strong>点击选择文件</strong></p>
+        </div>
+        <div id="qr-preview-wrap" style="display:none;margin-top:8px">
+          <img id="qr-preview-img" src="" alt="preview" style="max-width:100%;border-radius:var(--r);border:1px solid var(--border)"/>
+          <p id="qr-file-name" style="font-size:.72rem;color:var(--muted);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></p>
+        </div>
+      </section>
+      <!-- Generate panel -->
+      <section id="qr-gen-panel" style="display:none">
+        <p class="sec-title">输入内容</p>
+        <textarea class="qr-gen-textarea" id="qr-gen-input" placeholder="输入文字、URL 或任意内容…"></textarea>
+        <button class="convert-btn" id="qr-gen-btn" style="margin-top:8px">生成二维码</button>
+      </section>
+      <div class="status-bar" id="qr-status-bar">
+        <div class="spinner" id="qr-spinner" style="display:none"></div>
+        <span id="qr-status-text">就绪</span>
+      </div>
+      <p id="qr-error-msg" class="error-msg" style="display:none"></p>
+    </div>
+    <div class="qr-main" id="qr-main">
+      <div class="qr-placeholder" id="qr-placeholder">
+        <div class="qr-placeholder-icon">📷</div>
+        <p id="qr-placeholder-text">上传含二维码的图片以识别</p>
+      </div>
+      <div id="qr-scan-result" style="display:none;width:100%;max-width:520px"></div>
+      <div id="qr-gen-result" style="display:none"></div>
     </div>
   </div>
 </div>
@@ -1746,6 +1901,149 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
   urlInput.addEventListener('keydown',e=>{if(e.key==='Enter')fetchBtn.click()});
 
   function showBiliError(msg){
+    errorMsg.textContent=msg;
+    errorMsg.style.display=msg?'block':'none';
+  }
+})();
+
+// ═════════════════════════════════════════════════════
+// QR CODE MODULE
+// ═════════════════════════════════════════════════════
+(()=>{
+  const scanPanel=$('qr-scan-panel'), genPanel=$('qr-gen-panel');
+  const dropZone=$('qr-drop-zone'), fileInput=$('qr-file-input');
+  const previewWrap=$('qr-preview-wrap'), previewImg=$('qr-preview-img');
+  const fileNameEl=$('qr-file-name');
+  const statusBar=$('qr-status-bar'), statusText=$('qr-status-text');
+  const spinner=$('qr-spinner'), errorMsg=$('qr-error-msg');
+  const placeholder=$('qr-placeholder'), placeholderText=$('qr-placeholder-text');
+  const scanResult=$('qr-scan-result'), genResult=$('qr-gen-result');
+  const genInput=$('qr-gen-input'), genBtn=$('qr-gen-btn');
+
+  // mode switch
+  document.querySelectorAll('input[name="qr-mode"]').forEach(r=>{
+    r.addEventListener('change',()=>{
+      const isScan=r.value==='scan';
+      scanPanel.style.display=isScan?'':'none';
+      genPanel.style.display=isScan?'none':'';
+      scanResult.style.display='none';
+      genResult.style.display='none';
+      placeholder.style.display='flex';
+      placeholderText.textContent=isScan?'上传含二维码的图片以识别':'输入内容后点击「生成二维码」';
+      showQrError('');
+      statusText.textContent='就绪';
+    });
+  });
+
+  // dep check
+  fetch('/qr-check').then(r=>r.json()).then(d=>{
+    if(!d.pyzbar) console.warn('[QR] pyzbar not available — scan may fail');
+    if(!d.qrcode) console.warn('[QR] qrcode not available — generate may fail');
+  }).catch(()=>{});
+
+  // ── Scan ─────────────────────────────────────────────
+  dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('over')});
+  dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('over'));
+  dropZone.addEventListener('drop',e=>{
+    e.preventDefault();dropZone.classList.remove('over');
+    const f=e.dataTransfer.files[0];
+    if(f&&f.type.startsWith('image/'))doScan(f);
+  });
+  fileInput.addEventListener('change',()=>{if(fileInput.files[0])doScan(fileInput.files[0])});
+
+  async function doScan(file){
+    previewImg.src=URL.createObjectURL(file);
+    fileNameEl.textContent=file.name;
+    previewWrap.style.display='block';
+    dropZone.querySelector('.drop-icon').style.display='none';
+    dropZone.querySelector('.drop-label').style.display='none';
+    showQrError('');
+    scanResult.style.display='none';
+    placeholder.style.display='flex';
+    placeholderText.textContent='识别中…';
+    setLoading(true,'识别中…');
+    try{
+      const fd=new FormData();fd.append('file',file);
+      const res=await fetch('/qr-scan',{method:'POST',body:fd});
+      const data=await res.json();
+      if(data.error){showQrError(data.error);placeholderText.textContent='识别失败';return}
+      renderScanResults(data.results);
+      statusText.textContent=`✓ 发现 ${data.results.length} 个码`;
+    }catch(e){
+      showQrError('请求失败：'+e.message);
+      placeholderText.textContent='识别失败';
+    }finally{setLoading(false,'就绪')}
+  }
+
+  function renderScanResults(results){
+    placeholder.style.display='none';
+    scanResult.innerHTML='';
+    const card=document.createElement('div');
+    card.className='qr-result-card';
+    card.innerHTML=`<h3>识别结果（${results.length} 个）</h3>`;
+    results.forEach((r,i)=>{
+      const isUrl=/^https?:\/\//i.test(r.data);
+      const dataHtml=isUrl
+        ?`<a href="${escHtml(r.data)}" target="_blank" rel="noopener noreferrer">${escHtml(r.data)}</a>`
+        :escHtml(r.data);
+      const item=document.createElement('div');
+      item.className='qr-result-item';
+      item.innerHTML=`<div class="qr-type-badge">${escHtml(r.type)}</div>
+        <div class="qr-data">${dataHtml}</div>
+        <div class="qr-copy-row">
+          <button class="btn-sm" onclick="navigator.clipboard.writeText(${JSON.stringify(r.data)}).then(()=>{this.textContent='✓ 已复制';setTimeout(()=>this.textContent='复制',1500)})">复制</button>
+          ${isUrl?`<button class="btn-sm" onclick="window.open(${JSON.stringify(r.data)},'_blank')">打开链接</button>`:''}
+        </div>`;
+      card.appendChild(item);
+    });
+    scanResult.appendChild(card);
+    scanResult.style.display='block';
+  }
+
+  function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+  // ── Generate ──────────────────────────────────────────
+  genBtn.addEventListener('click',doGenerate);
+  genInput.addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter')doGenerate()});
+
+  async function doGenerate(){
+    const text=genInput.value.trim();
+    if(!text){showQrError('请输入内容');return}
+    showQrError('');
+    genResult.style.display='none';
+    placeholder.style.display='flex';
+    placeholderText.textContent='生成中…';
+    setLoading(true,'生成中…');
+    try{
+      const res=await fetch('/qr-generate',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({text})
+      });
+      const data=await res.json();
+      if(data.error){showQrError(data.error);placeholderText.textContent='生成失败';return}
+      placeholder.style.display='none';
+      genResult.innerHTML=`<div class="qr-img-wrap">
+        <img src="${data.image}" alt="QR Code"/>
+        <div style="margin-top:12px;display:flex;gap:8px;justify-content:center">
+          <button class="btn-sm" onclick="(()=>{const a=document.createElement('a');a.href='${data.image}';a.download='qrcode.png';a.click()})()">下载 PNG</button>
+          <button class="btn-sm" onclick="navigator.clipboard.write([new ClipboardItem({'image/png':fetch('${data.image}').then(r=>r.blob())})]).then(()=>{this.textContent='✓ 已复制';setTimeout(()=>this.textContent='复制图片',1500)}).catch(()=>alert('浏览器不支持复制图片'))">复制图片</button>
+        </div>
+      </div>`;
+      genResult.style.display='block';
+      statusText.textContent='✓ 生成成功';
+    }catch(e){
+      showQrError('请求失败：'+e.message);
+      placeholderText.textContent='生成失败';
+    }finally{setLoading(false,'就绪')}
+  }
+
+  function setLoading(on,msg){
+    if(on){statusBar.classList.add('loading');spinner.style.display='block'}
+    else{statusBar.classList.remove('loading');spinner.style.display='none'}
+    statusText.textContent=msg;
+  }
+  function showQrError(msg){
     errorMsg.textContent=msg;
     errorMsg.style.display=msg?'block':'none';
   }
