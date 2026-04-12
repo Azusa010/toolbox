@@ -65,6 +65,26 @@ except ImportError:
     except Exception:
         QRCODE_OK = False
 
+try:
+    import requests as _requests
+    from bs4 import BeautifulSoup as _BS
+    REQUESTS_OK = True
+except ImportError:
+    try:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "requests", "beautifulsoup4", "lxml", "-q"])
+        import requests as _requests
+        from bs4 import BeautifulSoup as _BS
+        REQUESTS_OK = True
+    except Exception:
+        REQUESTS_OK = False
+
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    PLAYWRIGHT_OK = True
+except ImportError:
+    PLAYWRIGHT_OK = False
+
 import base64
 
 # ── Conversion core ───────────────────────────────────────────────────────────
@@ -440,6 +460,8 @@ def bilibili_info():
             uploader  = info.get("uploader", "")
             duration  = info.get("duration", 0)
 
+        video_id = info.get("id", "")
+
         return jsonify({
             "title":       info.get("title", "未知标题"),
             "duration":    duration,
@@ -447,6 +469,7 @@ def bilibili_info():
             "thumbnail":   thumbnail,
             "is_playlist": is_playlist,
             "parts":       parts,
+            "video_id":    video_id,
         })
     except _subprocess.TimeoutExpired:
         return jsonify({"error": "获取信息超时"}), 500
@@ -659,6 +682,279 @@ def qr_scan():
         return jsonify({"error": str(exc)}), 500
 
 
+# ── Image Grabber ─────────────────────────────────────────────────────────────
+
+import urllib.parse as _urllib_parse
+
+# Known data-* attributes used by lazy-loaders / CMS / CDNs
+_IMG_DATA_ATTRS = [
+    "src", "data-src", "data-lazy-src", "data-original", "data-image",
+    "data-img", "data-url", "data-thumb", "data-photo", "data-pic",
+    "data-large", "data-full", "data-hires", "data-retina", "data-zoom-image",
+    "data-main-image", "data-bg", "data-background", "data-poster",
+    "data-echo", "data-lazyload", "data-lazy", "data-normal", "data-800",
+    "data-1000", "data-original-src", "data-fallback-src", "data-hi-res",
+    "data-desktop-src", "data-mobile-src", "data-pin-media",
+    "data-flickity-lazyload", "data-jpibfi-src",
+]
+
+_CSS_URL_RE  = re.compile(r'url\(\s*["\']?([^"\')\s]+)["\']?\s*\)', re.IGNORECASE)
+_IMG_EXT_RE  = re.compile(
+    r'https?://[^\s"\'<>{}\[\]\\]+\.(?:jpe?g|png|gif|webp|avif|svg|bmp|tiff?|ico)'
+    r'(?:[?#][^\s"\'<>]*)?', re.IGNORECASE)
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+}
+
+
+def _make_session() -> "_requests.Session":
+    s = _requests.Session()
+    s.headers.update(_BROWSER_HEADERS)
+    return s
+
+
+def _parse_images_from_html(html: str, base_url: str) -> list[dict]:
+    """Comprehensive image URL extraction from raw HTML."""
+    seen: set[str] = set()
+    images: list[dict] = []
+
+    def add(src: str, alt: str = "", w=None, h=None):
+        src = src.strip()
+        if not src or src.startswith("data:") or src.startswith("javascript:"):
+            return
+        try:
+            abs_url = _urllib_parse.urljoin(base_url, src)
+        except Exception:
+            return
+        if not abs_url.startswith("http"):
+            return
+        key = _urllib_parse.urldefrag(abs_url)[0]
+        if key in seen:
+            return
+        seen.add(key)
+        images.append({"url": abs_url, "alt": alt or "", "width": w, "height": h})
+
+    soup = _BS(html, "lxml") if REQUESTS_OK else _BS(html, "html.parser")
+
+    # ── 1. <img> — all known data-* lazy attrs ────────────────────────
+    for tag in soup.find_all("img"):
+        added = False
+        for attr in _IMG_DATA_ATTRS:
+            val = tag.get(attr, "")
+            if val:
+                add(val, tag.get("alt", ""), tag.get("width"), tag.get("height"))
+                added = True
+                break
+        # srcset on <img>
+        for part in (tag.get("srcset") or "").split(","):
+            p = part.strip().split()
+            if p:
+                add(p[0])
+
+    # ── 2. <picture> / <source> ───────────────────────────────────────
+    for tag in soup.find_all("source"):
+        for part in (tag.get("srcset") or "").split(","):
+            p = part.strip().split()
+            if p:
+                add(p[0])
+        if tag.get("src"):
+            add(tag["src"])
+
+    # ── 3. <meta> OG / Twitter card ──────────────────────────────────
+    for tag in soup.find_all("meta"):
+        prop = (tag.get("property") or tag.get("name") or "").lower()
+        if prop in ("og:image", "og:image:url", "twitter:image",
+                    "twitter:image:src", "thumbnail"):
+            add(tag.get("content", ""))
+
+    # ── 4. <link> preload / icon ──────────────────────────────────────
+    for tag in soup.find_all("link", href=True):
+        rel = " ".join(tag.get("rel") or []).lower()
+        if any(k in rel for k in ("preload", "icon", "thumbnail", "image")):
+            add(tag["href"])
+
+    # ── 5. <a href> pointing directly to image files ─────────────────
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        if re.search(r'\.(jpe?g|png|gif|webp|avif|svg|bmp)([?#]|$)', href, re.I):
+            add(href)
+
+    # ── 6. Inline style="background-image: url(...)" ──────────────────
+    for tag in soup.find_all(style=True):
+        for m in _CSS_URL_RE.finditer(tag["style"]):
+            add(m.group(1))
+
+    # ── 7. <style> block CSS ──────────────────────────────────────────
+    for tag in soup.find_all("style"):
+        for m in _CSS_URL_RE.finditer(tag.get_text()):
+            add(m.group(1))
+
+    # ── 8. data-bg / data-background / data-background-image ──────────
+    for attr in ("data-bg", "data-background", "data-background-image",
+                 "data-lazy-background", "data-section-bg"):
+        for tag in soup.find_all(attrs={attr: True}):
+            val = tag[attr]
+            m = _CSS_URL_RE.search(val)
+            add(m.group(1) if m else val)
+
+    # ── 9. JSON-LD / script body — regex mine image URLs ─────────────
+    for script in soup.find_all("script"):
+        text = script.get_text()
+        keywords = ("image", "photo", "thumb", "picture", "poster", "cover", "avatar")
+        if any(k in text.lower() for k in keywords):
+            for m in _IMG_EXT_RE.finditer(text):
+                add(m.group(0))
+
+    # ── 10. Any element with common image attribute patterns ──────────
+    # (catches Vue/React rendered attrs that BS4 sees as literals)
+    for m in _IMG_EXT_RE.finditer(html):
+        add(m.group(0))
+
+    return images
+
+
+def _grab_with_requests(url: str) -> tuple[list[dict], str]:
+    """Fetch page with requests and parse all images."""
+    sess = _make_session()
+    resp = sess.get(url, timeout=20, allow_redirects=True)
+    resp.raise_for_status()
+    final_url = resp.url
+    encoding = resp.encoding or resp.apparent_encoding or "utf-8"
+    html = resp.content.decode(encoding, errors="replace")
+    return _parse_images_from_html(html, final_url), final_url
+
+
+def _grab_with_playwright(url: str) -> tuple[list[dict], str]:
+    """Render page in headless Chromium, wait for network idle, then parse."""
+    with _sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=_BROWSER_HEADERS["User-Agent"],
+            locale="zh-CN",
+        )
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        # scroll to trigger lazy-loaders
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1500)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+        html = page.content()
+        final_url = page.url
+        browser.close()
+    return _parse_images_from_html(html, final_url), final_url
+
+
+@app.route("/imgrab-check", methods=["GET"])
+def imgrab_check():
+    return jsonify({
+        "requests_ok": REQUESTS_OK,
+        "playwright_ok": PLAYWRIGHT_OK,
+    })
+
+
+@app.route("/img-grab", methods=["POST"])
+def img_grab():
+    data = request.get_json() or {}
+    url = data.get("url", "").strip()
+    use_browser = data.get("browser", False)
+    if not url:
+        return jsonify({"error": "请输入网址"}), 400
+    if not url.startswith("http"):
+        url = "https://" + url
+    try:
+        if use_browser:
+            if not PLAYWRIGHT_OK:
+                return jsonify({"error": "Playwright 未安装，请运行：pip install playwright && playwright install chromium"}), 400
+            images, final_url = _grab_with_playwright(url)
+            method = "playwright"
+        else:
+            if not REQUESTS_OK:
+                return jsonify({"error": "requests/beautifulsoup4 未安装"}), 400
+            images, final_url = _grab_with_requests(url)
+            method = "requests"
+        return jsonify({"images": images, "page_url": final_url,
+                        "count": len(images), "method": method})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/img-proxy", methods=["GET"])
+def img_proxy():
+    img_url = request.args.get("url", "").strip()
+    if not img_url or not img_url.startswith("http"):
+        return jsonify({"error": "无效链接"}), 400
+    try:
+        if REQUESTS_OK:
+            resp = _make_session().get(img_url, timeout=12, stream=True)
+            resp.raise_for_status()
+            ct = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+            if not ct.startswith("image/"):
+                ct = "image/jpeg"
+            return send_file(io.BytesIO(resp.content), mimetype=ct)
+        else:
+            import urllib.request as _ur
+            req = _ur.Request(img_url, headers={"User-Agent": _BROWSER_HEADERS["User-Agent"]})
+            with _ur.urlopen(req, timeout=12) as r:
+                ct = r.info().get_content_type() or "image/jpeg"
+                return send_file(io.BytesIO(r.read()), mimetype=ct)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/img-download-zip", methods=["POST"])
+def img_download_zip():
+    import zipfile as _zf
+    data = request.get_json() or {}
+    urls = data.get("urls", [])
+    if not urls:
+        return jsonify({"error": "未选择图片"}), 400
+
+    sess = _make_session() if REQUESTS_OK else None
+    buf = io.BytesIO()
+    seen_names: dict[str, int] = {}
+
+    with _zf.ZipFile(buf, "w", _zf.ZIP_STORED) as zf:
+        for i, img_url in enumerate(urls[:200]):
+            try:
+                if sess:
+                    resp = sess.get(img_url, timeout=15)
+                    resp.raise_for_status()
+                    content = resp.content
+                    ct = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+                else:
+                    import urllib.request as _ur
+                    req = _ur.Request(img_url, headers={"User-Agent": _BROWSER_HEADERS["User-Agent"]})
+                    with _ur.urlopen(req, timeout=15) as r:
+                        content = r.read()
+                        ct = r.info().get_content_type() or "image/jpeg"
+                path = _urllib_parse.urlparse(img_url).path
+                fname = Path(path).name or f"image_{i+1}"
+                if not Path(fname).suffix:
+                    ext = ct.split("/")[-1].replace("jpeg", "jpg")[:6]
+                    fname = f"{fname}.{ext}"
+                if fname in seen_names:
+                    seen_names[fname] += 1
+                    base, ext = fname.rsplit(".", 1) if "." in fname else (fname, "")
+                    fname = f"{base}_{seen_names[fname]}.{ext}" if ext else f"{fname}_{seen_names[fname]}"
+                else:
+                    seen_names[fname] = 0
+                zf.writestr(fname, content)
+            except Exception:
+                pass
+
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name="images.zip",
+                     mimetype="application/zip")
+
+
 @app.route("/qr-generate", methods=["POST"])
 def qr_generate():
     if not QRCODE_OK:
@@ -856,6 +1152,26 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
 .qr-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);text-align:center}
 .qr-placeholder-icon{font-size:3rem;opacity:.3}
 @media(max-width:700px){.qr-container{grid-template-columns:1fr;grid-template-rows:auto 1fr}.qr-sidebar{border-right:none;border-bottom:1px solid var(--border)}}
+/* ── Image Grabber ── */
+.imgrab-container{display:grid;grid-template-columns:280px 1fr;flex:1;overflow:hidden}
+.imgrab-sidebar{border-right:1px solid var(--border);padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+.imgrab-main{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+.imgrab-toolbar{border-bottom:1px solid var(--border);padding:8px 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--surface)}
+.imgrab-grid{flex:1;overflow-y:auto;padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;align-content:start}
+.imgrab-card{border:2px solid var(--border);border-radius:var(--r);overflow:hidden;cursor:pointer;transition:border-color .15s;position:relative;background:var(--surface)}
+.imgrab-card:hover{border-color:var(--accent)}
+.imgrab-card.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(88,166,255,.3)}
+.imgrab-check{position:absolute;top:6px;left:6px;width:18px;height:18px;accent-color:var(--accent);cursor:pointer;z-index:2}
+.imgrab-thumb{width:100%;height:130px;object-fit:cover;display:block;background:var(--border)}
+.imgrab-card-info{padding:5px 8px;font-size:.68rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.imgrab-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);height:100%;grid-column:1/-1}
+.imgrab-placeholder-icon{font-size:3rem;opacity:.3}
+.imgrab-url-input{width:100%;padding:8px 12px;border-radius:var(--r);background:var(--surface);color:var(--text);border:1px solid var(--border);font-size:.85rem;outline:none}
+.imgrab-url-input:focus{border-color:var(--accent)}
+.imgrab-dl-btn{padding:5px 16px;background:var(--accent);color:#000;border:none;border-radius:5px;font-size:.8rem;font-weight:700;cursor:pointer;transition:opacity .15s;white-space:nowrap}
+.imgrab-dl-btn:disabled{opacity:.35;cursor:not-allowed}
+.imgrab-dl-btn:hover:not(:disabled){opacity:.85}
+@media(max-width:700px){.imgrab-container{grid-template-columns:1fr;grid-template-rows:auto 1fr}.imgrab-sidebar{border-right:none;border-bottom:1px solid var(--border)}}
 </style>
 </head>
 <body>
@@ -869,9 +1185,10 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
       <button class="nav-tab" data-tab="audio">🎵 音频转换</button>
       <button class="nav-tab" data-tab="bili">📺 B站下载</button>
       <button class="nav-tab" data-tab="qr">📷 二维码</button>
+      <button class="nav-tab" data-tab="imgrab">🖼️ 图片抓取</button>
     </nav>
   </div>
-  <span class="badge">v2.4</span>
+  <span class="badge">v2.5</span>
 </header>
 
 <!-- ASCII Art Module -->
@@ -1209,11 +1526,25 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
         <p style="font-size:.75rem;margin-top:6px;color:var(--muted)">需要安装 yt-dlp 和 ffmpeg</p>
         <p id="bili-dep-warn" style="display:none;margin-top:14px"></p>
       </div>
-      <div id="bili-info-panel" style="display:none;width:100%;max-width:520px">
+      <div id="bili-info-panel" style="display:none;width:100%;max-width:560px">
         <div class="bili-info-card">
-          <img id="bili-thumb" class="bili-thumb" src="" alt="封面" style="display:none"/>
           <div class="bili-title" id="bili-title"></div>
           <div class="bili-meta" id="bili-meta"></div>
+        </div>
+        <div id="bili-player-wrap" style="display:none;margin-top:10px;border-radius:var(--r);overflow:hidden;background:#000;aspect-ratio:16/9">
+          <iframe id="bili-player-iframe"
+            src=""
+            width="100%" height="100%"
+            scrolling="no" border="0" frameborder="no" framespacing="0"
+            allowfullscreen="true"
+            style="display:block;border:none">
+          </iframe>
+        </div>
+        <div id="bili-preview-wrap" style="display:none;margin-top:12px">
+          <p class="sec-title" style="margin-bottom:6px">预览</p>
+          <video id="bili-video-preview" controls style="width:100%;border-radius:var(--r);background:#000;display:none;max-height:320px"></video>
+          <audio id="bili-audio-preview" controls style="width:100%;margin-top:4px;display:none"></audio>
+          <p id="bili-preview-name" style="font-size:.72rem;color:var(--muted);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></p>
         </div>
       </div>
     </div>
@@ -1269,6 +1600,64 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
       </div>
       <div id="qr-scan-result" style="display:none;width:100%;max-width:520px"></div>
       <div id="qr-gen-result" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Image Grabber Module -->
+<div id="module-imgrab" class="module">
+  <div class="module-header">
+    <h2>🖼️ 网站图片抓取</h2>
+    <p class="module-desc">输入网页地址，一键获取页面上的所有图片，勾选后批量下载</p>
+  </div>
+  <div class="imgrab-container">
+    <div class="imgrab-sidebar">
+      <section>
+        <p class="sec-title">网页地址</p>
+        <input type="text" class="imgrab-url-input" id="imgrab-url-input" placeholder="https://example.com"/>
+        <button class="convert-btn" id="imgrab-fetch-btn" style="margin-top:8px">获取图片</button>
+      </section>
+      <section>
+        <p class="sec-title">抓取模式</p>
+        <div class="toggle-row" style="margin-bottom:6px">
+          <span style="font-size:.82rem">🌐 浏览器渲染（JS 页面）</span>
+          <label class="toggle">
+            <input type="checkbox" id="imgrab-browser-toggle"/>
+            <div class="toggle-track"></div>
+            <div class="toggle-thumb"></div>
+          </label>
+        </div>
+        <p id="imgrab-browser-hint" style="font-size:.7rem;color:var(--muted);line-height:1.5">
+          启用后使用 Playwright 无头浏览器，可抓取 JS 渲染页面，但速度较慢。<br>
+          需先运行：<code style="color:var(--accent)">pip install playwright && playwright install chromium</code>
+        </p>
+        <p id="imgrab-playwright-warn" style="display:none;font-size:.75rem;color:var(--danger);margin-top:4px"></p>
+      </section>
+      <section class="ctrl">
+        <label class="lbl">最小尺寸过滤：<span id="imgrab-minsize-val">50</span> px</label>
+        <input type="range" id="imgrab-minsize" min="0" max="400" value="50" step="10"/>
+        <p style="font-size:.7rem;color:var(--muted);margin-top:3px">过滤掉宽高均小于该值的小图</p>
+      </section>
+      <div class="status-bar" id="imgrab-status-bar">
+        <div class="spinner" id="imgrab-spinner" style="display:none"></div>
+        <span id="imgrab-status-text">输入网址后点击获取</span>
+      </div>
+      <p id="imgrab-error-msg" class="error-msg" style="display:none"></p>
+    </div>
+    <div class="imgrab-main">
+      <div class="imgrab-toolbar" id="imgrab-toolbar" style="display:none">
+        <button class="btn-sm" id="imgrab-sel-all">全选</button>
+        <button class="btn-sm" id="imgrab-sel-none">取消全选</button>
+        <button class="btn-sm" id="imgrab-sel-invert">反选</button>
+        <span class="toolbar-info" id="imgrab-sel-info" style="flex:1"></span>
+        <button class="imgrab-dl-btn" id="imgrab-dl-btn" disabled>⬇ 下载选中</button>
+      </div>
+      <div id="imgrab-grid" class="imgrab-grid">
+        <div class="imgrab-placeholder" id="imgrab-placeholder">
+          <div class="imgrab-placeholder-icon">🖼️</div>
+          <p>输入网址后点击「获取图片」</p>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1821,16 +2210,38 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
     }
   });
 
+  function clearBiliPreview(){
+    $('bili-preview-wrap').style.display='none';
+    const v=$('bili-video-preview'),a=$('bili-audio-preview');
+    v.pause();v.src='';v.style.display='none';
+    a.pause();a.src='';a.style.display='none';
+    $('bili-preview-name').textContent='';
+    $('bili-player-wrap').style.display='none';
+    $('bili-player-iframe').src='';
+  }
+
   function showInfo(info){
+    clearBiliPreview();
     placeholder.style.display='none';
     infoPanel.style.display='block';
     $('bili-title').textContent=info.title||'未知标题';
     const dur=info.duration?formatDur(info.duration):'';
     const partCount=info.is_playlist?`${info.parts.length} P`:'';
     $('bili-meta').textContent=[info.uploader,partCount,dur].filter(Boolean).join(' · ');
-    const thumb=$('bili-thumb');
-    if(info.thumbnail){thumb.src=info.thumbnail;thumb.style.display='block'}
-    else{thumb.style.display='none'}
+    // 嵌入 B站播放器
+    const vid=info.video_id||'';
+    const playerWrap=$('bili-player-wrap');
+    const playerIframe=$('bili-player-iframe');
+    if(vid&&!info.is_playlist){
+      const isBV=/^BV/i.test(vid);
+      const embedSrc=isBV
+        ?`https://player.bilibili.com/player.html?bvid=${vid}&autoplay=0`
+        :`https://player.bilibili.com/player.html?aid=${vid.replace(/^av/i,'')}&autoplay=0`;
+      playerIframe.src=embedSrc;
+      playerWrap.style.display='block';
+    }else{
+      playerWrap.style.display='none';
+    }
     // part selector
     if(info.is_playlist&&info.parts.length>0){
       partSec.style.display='';
@@ -1885,7 +2296,30 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
       const cd=res.headers.get('Content-Disposition')||'';
       const match=cd.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
       const fname=match?decodeURIComponent(match[1].replace(/['"]/g,'')):(allParts?'bilibili_videos.zip':mode==='audio'?`audio.${audioFmt}`:'video.mp4');
-      Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:fname}).click();
+      const blobUrl=URL.createObjectURL(blob);
+      Object.assign(document.createElement('a'),{href:blobUrl,download:fname}).click();
+      // 预览（zip 不预览）
+      const previewWrap=$('bili-preview-wrap');
+      const videoEl=$('bili-video-preview');
+      const audioEl=$('bili-audio-preview');
+      const previewName=$('bili-preview-name');
+      if(!allParts&&blob.size>0){
+        if(mode==='audio'){
+          videoEl.style.display='none';
+          videoEl.src='';
+          audioEl.src=blobUrl;
+          audioEl.style.display='block';
+        }else{
+          audioEl.style.display='none';
+          audioEl.src='';
+          videoEl.src=blobUrl;
+          videoEl.style.display='block';
+        }
+        previewName.textContent=fname;
+        previewWrap.style.display='block';
+      }else{
+        previewWrap.style.display='none';
+      }
       statusText.textContent='✓ 下载完成';
     }catch(e){
       showBiliError('请求失败：'+e.message);
@@ -2044,6 +2478,237 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
     statusText.textContent=msg;
   }
   function showQrError(msg){
+    errorMsg.textContent=msg;
+    errorMsg.style.display=msg?'block':'none';
+  }
+})();
+
+// ═════════════════════════════════════════════════════
+// IMAGE GRABBER MODULE
+// ═════════════════════════════════════════════════════
+(()=>{
+  const urlInput=$('imgrab-url-input');
+  const fetchBtn=$('imgrab-fetch-btn');
+  const statusBar=$('imgrab-status-bar');
+  const statusText=$('imgrab-status-text');
+  const spinner=$('imgrab-spinner');
+  const errorMsg=$('imgrab-error-msg');
+  const toolbar=$('imgrab-toolbar');
+  const grid=$('imgrab-grid');
+  const selInfo=$('imgrab-sel-info');
+  const dlBtn=$('imgrab-dl-btn');
+  const minSizeRange=$('imgrab-minsize');
+  const minSizeVal=$('imgrab-minsize-val');
+  const browserToggle=$('imgrab-browser-toggle');
+  const playwrightWarn=$('imgrab-playwright-warn');
+
+  let allImages=[];
+  let minSize=50;
+  let playwrightOk=false;
+
+  // Check env on tab activation
+  document.querySelector('[data-tab="imgrab"]').addEventListener('click',()=>{
+    fetch('/imgrab-check').then(r=>r.json()).then(d=>{
+      playwrightOk=d.playwright_ok;
+      if(!d.requests_ok){
+        showError('requests/beautifulsoup4 未安装，请重启应用自动安装');
+      }
+      updateBrowserHint();
+    }).catch(()=>{});
+  });
+
+  browserToggle.addEventListener('change', updateBrowserHint);
+
+  function updateBrowserHint(){
+    if(browserToggle.checked&&!playwrightOk){
+      playwrightWarn.style.display='block';
+      playwrightWarn.textContent='⚠️ Playwright 未安装，开启后抓取时会提示错误';
+    }else{
+      playwrightWarn.style.display='none';
+    }
+  }
+
+  minSizeRange.addEventListener('input',()=>{
+    minSize=parseInt(minSizeRange.value);
+    minSizeVal.textContent=minSize;
+    applyFilter();
+  });
+
+  function applyFilter(){
+    let visCount=0, selCount=0;
+    allImages.forEach(item=>{
+      const w=item.naturalW, h=item.naturalH;
+      // show if not yet loaded (w===0), or if passes size filter
+      const pass=(w===0&&h===0)||minSize===0||(w>=minSize||h>=minSize);
+      item.card.style.display=pass?'':'none';
+      if(pass){
+        visCount++;
+        if(item.check.checked) selCount++;
+      }
+    });
+    selInfo.textContent=`已选 ${selCount} / ${visCount} 张（共解析 ${allImages.length} 个）`;
+    dlBtn.disabled=selCount===0;
+  }
+
+  function updateSelInfo(){ applyFilter(); }
+
+  fetchBtn.addEventListener('click', doFetch);
+  urlInput.addEventListener('keydown',e=>{if(e.key==='Enter')doFetch()});
+
+  async function doFetch(){
+    const url=urlInput.value.trim();
+    if(!url){showError('请输入网址');return}
+    showError('');
+    const useBrowser=browserToggle.checked;
+    const modeLabel=useBrowser?'浏览器渲染模式':'普通抓取模式';
+    setLoading(true,`${modeLabel}，正在获取页面…`);
+    fetchBtn.disabled=true;
+    allImages=[];
+    // keep placeholder visible until we have results
+    grid.innerHTML='<div class="imgrab-placeholder" id="imgrab-placeholder"><div class="imgrab-placeholder-icon" style="animation:spin 1s linear infinite">⏳</div><p>正在抓取，请稍候…</p></div>';
+    toolbar.style.display='none';
+    try{
+      const res=await fetch('/img-grab',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url, browser:useBrowser})
+      });
+      const data=await res.json();
+      if(data.error){
+        showError(data.error);
+        grid.innerHTML='<div class="imgrab-placeholder"><div class="imgrab-placeholder-icon">❌</div><p>抓取失败</p></div>';
+        return;
+      }
+      if(!data.images||data.images.length===0){
+        grid.innerHTML='<div class="imgrab-placeholder"><div class="imgrab-placeholder-icon">🔍</div><p>未在该页面找到图片</p><p style="font-size:.75rem;margin-top:6px;color:var(--muted)">可尝试开启「浏览器渲染」模式</p></div>';
+        setLoading(false,'未找到图片');
+        return;
+      }
+      grid.innerHTML='';
+      toolbar.style.display='flex';
+      renderImages(data.images);
+      const methodTag=data.method==='playwright'?'[Playwright]':'[requests]';
+      setLoading(false,`${methodTag} 解析到 ${data.images.length} 个图片，加载中…`);
+    }catch(e){
+      showError('请求失败：'+e.message);
+      setLoading(false,'出错');
+    }finally{
+      fetchBtn.disabled=false;
+    }
+  }
+
+  function renderImages(images){
+    images.forEach((img)=>{
+      const idx=allImages.length;
+      const card=document.createElement('div');
+      card.className='imgrab-card';
+
+      const check=document.createElement('input');
+      check.type='checkbox';
+      check.className='imgrab-check';
+      check.addEventListener('change', updateSelInfo);
+
+      const thumbEl=document.createElement('img');
+      thumbEl.className='imgrab-thumb';
+      thumbEl.loading='lazy';
+      thumbEl.alt=img.alt||'';
+
+      const info=document.createElement('div');
+      info.className='imgrab-card-info';
+      const basename=decodeURIComponent(img.url.split('/').pop().split('?')[0])||'图片';
+      info.textContent=img.alt||basename;
+
+      const entry={url:img.url, alt:img.alt, card, check, naturalW:0, naturalH:0};
+      allImages.push(entry);
+
+      thumbEl.onload=()=>{
+        entry.naturalW=thumbEl.naturalWidth;
+        entry.naturalH=thumbEl.naturalHeight;
+        if(entry.naturalW&&entry.naturalH){
+          info.textContent=`${entry.naturalW}×${entry.naturalH}` + (img.alt?`  ${img.alt}`:'');
+        }
+        applyFilter();
+        // Update status once all loaded
+        const loaded=allImages.filter(i=>i.naturalW>0||i.naturalH>0).length;
+        if(loaded===allImages.length){
+          const visible=allImages.filter(i=>i.card.style.display!=='none').length;
+          setLoading(false,`加载完成，显示 ${visible} 张`);
+        }
+      };
+      thumbEl.onerror=()=>{
+        entry.naturalW=-1; entry.naturalH=-1;
+        card.style.opacity='.3';
+        card.title='图片加载失败';
+        applyFilter();
+      };
+
+      // Use proxy to bypass CORS
+      thumbEl.src=`/img-proxy?url=${encodeURIComponent(img.url)}`;
+
+      card.addEventListener('click',e=>{
+        if(e.target===check)return;
+        check.checked=!check.checked;
+        updateSelInfo();
+      });
+
+      card.appendChild(check);
+      card.appendChild(thumbEl);
+      card.appendChild(info);
+      grid.appendChild(card);
+    });
+    applyFilter();
+  }
+
+  // Toolbar buttons
+  $('imgrab-sel-all').addEventListener('click',()=>{
+    allImages.forEach(i=>{if(i.card.style.display!=='none')i.check.checked=true});
+    updateSelInfo();
+  });
+  $('imgrab-sel-none').addEventListener('click',()=>{
+    allImages.forEach(i=>i.check.checked=false);
+    updateSelInfo();
+  });
+  $('imgrab-sel-invert').addEventListener('click',()=>{
+    allImages.forEach(i=>{if(i.card.style.display!=='none')i.check.checked=!i.check.checked});
+    updateSelInfo();
+  });
+
+  dlBtn.addEventListener('click',async()=>{
+    const selected=allImages.filter(i=>i.card.style.display!=='none'&&i.check.checked);
+    if(!selected.length)return;
+    dlBtn.disabled=true;
+    setLoading(true,`正在下载 ${selected.length} 张图片…`);
+    showError('');
+    try{
+      const res=await fetch('/img-download-zip',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({urls:selected.map(i=>i.url)})
+      });
+      if(!res.ok){
+        const err=await res.json().catch(()=>({error:'下载失败'}));
+        showError(err.error||'下载失败');
+        return;
+      }
+      const blob=await res.blob();
+      Object.assign(document.createElement('a'),{
+        href:URL.createObjectURL(blob), download:'images.zip'
+      }).click();
+      setLoading(false,`✓ 已下载 ${selected.length} 张图片`);
+    }catch(e){
+      showError('下载失败：'+e.message);
+      setLoading(false,'出错');
+    }finally{
+      dlBtn.disabled=false;
+    }
+  });
+
+  function setLoading(on, msg){
+    if(on){statusBar.classList.add('loading');spinner.style.display='block'}
+    else{statusBar.classList.remove('loading');spinner.style.display='none'}
+    if(msg!==undefined) statusText.textContent=msg;
+  }
+  function showError(msg){
     errorMsg.textContent=msg;
     errorMsg.style.display=msg?'block':'none';
   }
