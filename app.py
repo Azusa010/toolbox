@@ -955,6 +955,182 @@ def img_download_zip():
                      mimetype="application/zip")
 
 
+# ── Aria2 Manager ─────────────────────────────────────────────────────────────
+
+import socket as _socket
+import signal as _signal
+
+_aria2_proc = None  # subprocess.Popen handle for the aria2c we spawned
+_ARIA2_RPC_PORT = 6800
+_ARIA2_RPC_SECRET = "ascii_art_tool"
+
+
+def _aria2_rpc(method: str, params=None):
+    """Call aria2 JSON-RPC. Returns (result, error)."""
+    import urllib.request as _ur
+    import json as _j
+    payload = _j.dumps({
+        "jsonrpc": "2.0", "id": "1", "method": method,
+        "params": [f"token:{_ARIA2_RPC_SECRET}"] + (params or [])
+    }).encode()
+    req = _ur.Request(
+        f"http://localhost:{_ARIA2_RPC_PORT}/jsonrpc",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with _ur.urlopen(req, timeout=3) as resp:
+            data = _j.loads(resp.read())
+            return data.get("result"), data.get("error")
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _aria2_running() -> bool:
+    """Quick TCP probe: is aria2c RPC port open?"""
+    try:
+        with _socket.create_connection(("localhost", _ARIA2_RPC_PORT), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+@app.route("/aria2-status", methods=["GET"])
+def aria2_status():
+    import shutil as _shutil
+    installed = bool(_shutil.which("aria2c"))
+    running = _aria2_running()
+    return jsonify({"installed": installed, "running": running,
+                    "port": _ARIA2_RPC_PORT})
+
+
+@app.route("/aria2-start", methods=["POST"])
+def aria2_start():
+    global _aria2_proc
+    import shutil as _shutil
+    if not _shutil.which("aria2c"):
+        return jsonify({"error": "未找到 aria2c，请先安装 aria2"}), 400
+    if _aria2_running():
+        return jsonify({"ok": True, "msg": "aria2 已在运行"})
+    try:
+        _aria2_proc = _subprocess.Popen([
+            "aria2c",
+            "--enable-rpc=true",
+            f"--rpc-listen-port={_ARIA2_RPC_PORT}",
+            f"--rpc-secret={_ARIA2_RPC_SECRET}",
+            "--rpc-listen-all=false",
+            "--daemon=false",
+            "--continue=true",
+            "--max-concurrent-downloads=5",
+            "--split=16",
+            "--min-split-size=1M",
+            "--max-connection-per-server=16",
+            "--allow-overwrite=true",
+        ], stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
+        # wait briefly for it to bind
+        import time as _time
+        for _ in range(20):
+            _time.sleep(0.1)
+            if _aria2_running():
+                return jsonify({"ok": True, "msg": "aria2 已启动"})
+        return jsonify({"error": "aria2c 启动超时，请检查端口是否被占用"}), 500
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/aria2-stop", methods=["POST"])
+def aria2_stop():
+    global _aria2_proc
+    _aria2_rpc("aria2.shutdown")
+    if _aria2_proc is not None:
+        try:
+            _aria2_proc.terminate()
+        except Exception:
+            pass
+        _aria2_proc = None
+    return jsonify({"ok": True, "msg": "aria2 已停止"})
+
+
+@app.route("/aria2-add", methods=["POST"])
+def aria2_add():
+    data = request.get_json() or {}
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "请输入下载链接"}), 400
+    if not _aria2_running():
+        return jsonify({"error": "aria2 未运行，请先启动"}), 400
+    options = {}
+    if data.get("dir"):
+        options["dir"] = data["dir"]
+    if data.get("filename"):
+        options["out"] = data["filename"]
+    result, err = _aria2_rpc("aria2.addUri", [[url], options])
+    if err:
+        return jsonify({"error": str(err)}), 500
+    return jsonify({"ok": True, "gid": result})
+
+
+@app.route("/aria2-list", methods=["GET"])
+def aria2_list():
+    if not _aria2_running():
+        return jsonify({"error": "aria2 未运行"}), 400
+    keys = ["gid", "status", "totalLength", "completedLength",
+            "downloadSpeed", "uploadSpeed", "files", "errorMessage"]
+    active, _ = _aria2_rpc("aria2.tellActive", [keys])
+    waiting, _ = _aria2_rpc("aria2.tellWaiting", [0, 50, keys])
+    stopped, _ = _aria2_rpc("aria2.tellStopped", [0, 20, keys])
+    return jsonify({
+        "active": active or [],
+        "waiting": waiting or [],
+        "stopped": stopped or [],
+    })
+
+
+@app.route("/aria2-remove", methods=["POST"])
+def aria2_remove():
+    data = request.get_json() or {}
+    gid = data.get("gid", "")
+    if not gid:
+        return jsonify({"error": "缺少 gid"}), 400
+    if not _aria2_running():
+        return jsonify({"error": "aria2 未运行"}), 400
+    result, err = _aria2_rpc("aria2.remove", [gid])
+    if err:
+        # try forceRemove
+        result, err = _aria2_rpc("aria2.forceRemove", [gid])
+    if err:
+        return jsonify({"error": str(err)}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/aria2-pause", methods=["POST"])
+def aria2_pause():
+    data = request.get_json() or {}
+    gid = data.get("gid", "")
+    if not gid:
+        return jsonify({"error": "缺少 gid"}), 400
+    if not _aria2_running():
+        return jsonify({"error": "aria2 未运行"}), 400
+    result, err = _aria2_rpc("aria2.pause", [gid])
+    if err:
+        return jsonify({"error": str(err)}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/aria2-resume", methods=["POST"])
+def aria2_resume():
+    data = request.get_json() or {}
+    gid = data.get("gid", "")
+    if not gid:
+        return jsonify({"error": "缺少 gid"}), 400
+    if not _aria2_running():
+        return jsonify({"error": "aria2 未运行"}), 400
+    result, err = _aria2_rpc("aria2.unpause", [gid])
+    if err:
+        return jsonify({"error": str(err)}), 500
+    return jsonify({"ok": True})
+
+
 @app.route("/qr-generate", methods=["POST"])
 def qr_generate():
     if not QRCODE_OK:
@@ -1172,6 +1348,42 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
 .imgrab-dl-btn:disabled{opacity:.35;cursor:not-allowed}
 .imgrab-dl-btn:hover:not(:disabled){opacity:.85}
 @media(max-width:700px){.imgrab-container{grid-template-columns:1fr;grid-template-rows:auto 1fr}.imgrab-sidebar{border-right:none;border-bottom:1px solid var(--border)}}
+/* ── Aria2 Manager ── */
+.aria2-container{display:grid;grid-template-columns:300px 1fr;flex:1;overflow:hidden}
+.aria2-sidebar{border-right:1px solid var(--border);padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+.aria2-main{display:flex;flex-direction:column;overflow:hidden}
+.aria2-power-btn{width:100%;padding:14px;font-size:1rem;font-weight:700;border:none;border-radius:var(--r);cursor:pointer;transition:background .2s,color .2s,box-shadow .2s}
+.aria2-power-btn.off{background:rgba(248,81,73,.15);color:var(--danger);border:1px solid var(--danger)}
+.aria2-power-btn.off:hover{background:rgba(248,81,73,.25)}
+.aria2-power-btn.on{background:rgba(63,185,80,.15);color:var(--green);border:1px solid var(--green)}
+.aria2-power-btn.on:hover{background:rgba(63,185,80,.25)}
+.aria2-status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.aria2-status-dot.off{background:var(--danger)}
+.aria2-status-dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.aria2-url-input{width:100%;padding:8px 12px;border-radius:var(--r);background:var(--surface);color:var(--text);border:1px solid var(--border);font-size:.85rem;outline:none;resize:vertical;min-height:60px;font-family:inherit}
+.aria2-url-input:focus{border-color:var(--accent)}
+.aria2-list-header{border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;gap:8px;background:var(--surface)}
+.aria2-list-header span{font-size:.8rem;font-weight:600;color:var(--muted)}
+.aria2-list-header .refresh-btn{margin-left:auto;padding:3px 10px;font-size:.75rem;background:transparent;border:1px solid var(--border);color:var(--text);border-radius:5px;cursor:pointer;transition:border-color .15s}
+.aria2-list-header .refresh-btn:hover{border-color:var(--accent);color:var(--accent)}
+.aria2-list{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:8px}
+.aria2-item{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px}
+.aria2-item-name{font-size:.82rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:5px}
+.aria2-item-meta{display:flex;align-items:center;gap:10px;font-size:.72rem;color:var(--muted)}
+.aria2-progress-wrap{margin:5px 0;height:4px;background:var(--border);border-radius:99px;overflow:hidden}
+.aria2-progress-bar{height:100%;border-radius:99px;transition:width .5s}
+.aria2-progress-bar.active{background:var(--accent)}
+.aria2-progress-bar.complete{background:var(--green)}
+.aria2-progress-bar.error{background:var(--danger)}
+.aria2-item-actions{display:flex;gap:6px;margin-top:6px}
+.aria2-act-btn{padding:2px 8px;font-size:.72rem;border:1px solid var(--border);background:transparent;color:var(--muted);border-radius:4px;cursor:pointer;transition:all .15s}
+.aria2-act-btn:hover{border-color:var(--accent);color:var(--accent)}
+.aria2-act-btn.danger:hover{border-color:var(--danger);color:var(--danger)}
+.aria2-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);flex:1}
+.aria2-placeholder-icon{font-size:3rem;opacity:.3}
+.aria2-not-installed{background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3);border-radius:var(--r);padding:12px 14px;font-size:.82rem;color:var(--danger);line-height:1.6}
+.aria2-not-installed code{color:var(--accent);font-size:.8rem}
+@media(max-width:700px){.aria2-container{grid-template-columns:1fr;grid-template-rows:auto 1fr}.aria2-sidebar{border-right:none;border-bottom:1px solid var(--border)}}
 </style>
 </head>
 <body>
@@ -1186,6 +1398,7 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
       <button class="nav-tab" data-tab="bili">📺 B站下载</button>
       <button class="nav-tab" data-tab="qr">📷 二维码</button>
       <button class="nav-tab" data-tab="imgrab">🖼️ 图片抓取</button>
+      <button class="nav-tab" data-tab="aria2">⬇️ Aria2</button>
     </nav>
   </div>
   <span class="badge">v2.5</span>
@@ -1656,6 +1869,64 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
         <div class="imgrab-placeholder" id="imgrab-placeholder">
           <div class="imgrab-placeholder-icon">🖼️</div>
           <p>输入网址后点击「获取图片」</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Aria2 Manager Module -->
+<div id="module-aria2" class="module">
+  <div class="module-header">
+    <h2>⬇️ Aria2 下载管理器</h2>
+    <p class="module-desc">内置 aria2c RPC 守护进程，支持 HTTP/FTP/磁力链接/BT 下载</p>
+  </div>
+  <div class="aria2-container">
+    <div class="aria2-sidebar">
+      <section>
+        <p class="sec-title">服务状态</p>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <span class="aria2-status-dot off" id="aria2-dot"></span>
+          <span id="aria2-status-text" style="font-size:.82rem;color:var(--muted)">未运行</span>
+        </div>
+        <button class="aria2-power-btn off" id="aria2-power-btn">启动 Aria2</button>
+        <p id="aria2-not-installed-hint" style="display:none;margin-top:8px" class="aria2-not-installed">
+          未找到 <strong>aria2c</strong>，请先安装 aria2：<br>
+          <code>Windows: winget install aria2</code><br>
+          <code>macOS:   brew install aria2</code><br>
+          <code>Linux:   apt install aria2</code>
+        </p>
+      </section>
+      <section>
+        <p class="sec-title">添加下载</p>
+        <textarea class="aria2-url-input" id="aria2-url-input"
+          placeholder="输入下载链接（HTTP/FTP/磁力/BT），每行一个&#10;支持批量添加"></textarea>
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <input type="text" id="aria2-savedir-input"
+            style="flex:1;padding:6px 10px;border-radius:var(--r);background:var(--surface);color:var(--text);border:1px solid var(--border);font-size:.78rem;outline:none"
+            placeholder="保存目录（可选）"/>
+        </div>
+        <button class="convert-btn" id="aria2-add-btn" disabled style="margin-top:8px">添加到队列</button>
+        <p id="aria2-add-msg" style="font-size:.75rem;margin-top:5px;display:none"></p>
+      </section>
+      <section>
+        <p class="sec-title">连接信息</p>
+        <div style="font-size:.75rem;color:var(--muted);line-height:1.8">
+          <div>端口：<code style="color:var(--accent)">6800</code></div>
+          <div>RPC 密钥：<code style="color:var(--accent)">ascii_art_tool</code></div>
+        </div>
+      </section>
+    </div>
+    <div class="aria2-main">
+      <div class="aria2-list-header">
+        <span>下载队列</span>
+        <span id="aria2-count" style="color:var(--muted);font-size:.72rem"></span>
+        <button class="refresh-btn" id="aria2-refresh-btn">刷新</button>
+      </div>
+      <div class="aria2-list" id="aria2-list">
+        <div class="aria2-placeholder" id="aria2-placeholder">
+          <div class="aria2-placeholder-icon">⬇️</div>
+          <p>启动 Aria2 后即可管理下载任务</p>
         </div>
       </div>
     </div>
@@ -2712,6 +2983,242 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
     errorMsg.textContent=msg;
     errorMsg.style.display=msg?'block':'none';
   }
+})();
+
+// ═════════════════════════════════════════════════════
+// ARIA2 MANAGER MODULE
+// ═════════════════════════════════════════════════════
+(()=>{
+  const powerBtn   = $('aria2-power-btn');
+  const dot        = $('aria2-dot');
+  const statusTxt  = $('aria2-status-text');
+  const notInstall = $('aria2-not-installed-hint');
+  const urlInput   = $('aria2-url-input');
+  const dirInput   = $('aria2-savedir-input');
+  const addBtn     = $('aria2-add-btn');
+  const addMsg     = $('aria2-add-msg');
+  const list       = $('aria2-list');
+  const placeholder= $('aria2-placeholder');
+  const countEl    = $('aria2-count');
+  const refreshBtn = $('aria2-refresh-btn');
+
+  let running = false;
+  let installed = false;
+  let pollTimer = null;
+
+  // Check status when tab clicked
+  document.querySelector('[data-tab="aria2"]').addEventListener('click', checkStatus);
+
+  async function checkStatus(){
+    try{
+      const d = await fetch('/aria2-status').then(r=>r.json());
+      installed = d.installed;
+      running = d.running;
+      updateUI();
+      if(running) loadList();
+    }catch(e){}
+  }
+
+  function updateUI(){
+    if(!installed){
+      dot.className='aria2-status-dot off';
+      statusTxt.textContent='未安装 aria2c';
+      powerBtn.textContent='未安装';
+      powerBtn.className='aria2-power-btn off';
+      powerBtn.disabled=true;
+      notInstall.style.display='block';
+      addBtn.disabled=true;
+      return;
+    }
+    notInstall.style.display='none';
+    powerBtn.disabled=false;
+    if(running){
+      dot.className='aria2-status-dot on';
+      statusTxt.textContent='运行中（端口 6800）';
+      powerBtn.textContent='停止 Aria2';
+      powerBtn.className='aria2-power-btn on';
+      addBtn.disabled=false;
+    }else{
+      dot.className='aria2-status-dot off';
+      statusTxt.textContent='未运行';
+      powerBtn.textContent='启动 Aria2';
+      powerBtn.className='aria2-power-btn off';
+      addBtn.disabled=true;
+    }
+  }
+
+  powerBtn.addEventListener('click', async()=>{
+    powerBtn.disabled=true;
+    if(running){
+      statusTxt.textContent='正在停止…';
+      await fetch('/aria2-stop',{method:'POST'});
+      running=false;
+      stopPoll();
+      list.innerHTML='';
+      list.appendChild(placeholder);
+      placeholder.style.display='flex';
+      countEl.textContent='';
+    }else{
+      statusTxt.textContent='正在启动…';
+      try{
+        const d = await fetch('/aria2-start',{method:'POST'}).then(r=>r.json());
+        if(d.error){
+          statusTxt.textContent='启动失败：'+d.error;
+          running=false;
+        }else{
+          running=true;
+          loadList();
+          startPoll();
+        }
+      }catch(e){
+        statusTxt.textContent='启动失败';
+        running=false;
+      }
+    }
+    updateUI();
+  });
+
+  addBtn.addEventListener('click', async()=>{
+    const raw=urlInput.value.trim();
+    if(!raw){showAddMsg('请输入下载链接','var(--danger)');return;}
+    const urls=raw.split('\n').map(u=>u.trim()).filter(Boolean);
+    showAddMsg('添加中…','var(--muted)');
+    addBtn.disabled=true;
+    let ok=0, fail=0;
+    for(const url of urls){
+      try{
+        const d=await fetch('/aria2-add',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({url,dir:dirInput.value.trim()||undefined})
+        }).then(r=>r.json());
+        if(d.ok) ok++;
+        else fail++;
+      }catch(e){fail++;}
+    }
+    showAddMsg(`已添加 ${ok} 个${fail?'，失败 '+fail+' 个':''}`,ok?'var(--green)':'var(--danger)');
+    if(ok>0){urlInput.value='';loadList();}
+    addBtn.disabled=false;
+  });
+
+  refreshBtn.addEventListener('click',()=>loadList());
+
+  async function loadList(){
+    if(!running)return;
+    try{
+      const d=await fetch('/aria2-list').then(r=>r.json());
+      if(d.error)return;
+      renderList(d);
+    }catch(e){}
+  }
+
+  function renderList(data){
+    const all=[
+      ...data.active.map(i=>({...i,_cat:'active'})),
+      ...data.waiting.map(i=>({...i,_cat:'waiting'})),
+      ...data.stopped.map(i=>({...i,_cat:'stopped'})),
+    ];
+    if(all.length===0){
+      list.innerHTML='';
+      list.appendChild(placeholder);
+      placeholder.style.display='flex';
+      placeholder.querySelector('p').textContent='暂无下载任务';
+      countEl.textContent='';
+      return;
+    }
+    placeholder.style.display='none';
+    countEl.textContent=`共 ${all.length} 个任务（活动 ${data.active.length}）`;
+    const frag=document.createDocumentFragment();
+    all.forEach(item=>{
+      const el=buildItem(item);
+      frag.appendChild(el);
+    });
+    list.innerHTML='';
+    list.appendChild(frag);
+  }
+
+  function buildItem(item){
+    const total=parseInt(item.totalLength)||0;
+    const done=parseInt(item.completedLength)||0;
+    const pct=total>0?Math.round(done/total*100):0;
+    const speed=parseInt(item.downloadSpeed)||0;
+    const cat=item._cat;
+    const name=getFilename(item)||item.gid;
+
+    const barClass=cat==='active'?'active':(cat==='stopped'&&!item.errorMessage)?'complete':'error';
+
+    const el=document.createElement('div');
+    el.className='aria2-item';
+    el.dataset.gid=item.gid;
+    el.innerHTML=`
+      <div class="aria2-item-name" title="${escH(name)}">${escH(name)}</div>
+      <div class="aria2-progress-wrap"><div class="aria2-progress-bar ${barClass}" style="width:${pct}%"></div></div>
+      <div class="aria2-item-meta">
+        <span>${statusLabel(cat,item)}</span>
+        <span>${pct}%</span>
+        <span>${fmtSize(done)} / ${fmtSize(total)}</span>
+        ${cat==='active'?`<span>↓ ${fmtSpeed(speed)}</span>`:''}
+      </div>
+      <div class="aria2-item-actions">
+        ${cat==='active'?`<button class="aria2-act-btn" data-act="pause">暂停</button>`:''}
+        ${cat==='waiting'?`<button class="aria2-act-btn" data-act="resume">继续</button>`:''}
+        <button class="aria2-act-btn danger" data-act="remove">删除</button>
+      </div>`;
+    el.querySelectorAll('[data-act]').forEach(btn=>{
+      btn.addEventListener('click',()=>itemAction(item.gid,btn.dataset.act));
+    });
+    return el;
+  }
+
+  async function itemAction(gid,act){
+    const ep=act==='remove'?'/aria2-remove':act==='pause'?'/aria2-pause':'/aria2-resume';
+    await fetch(ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({gid})});
+    loadList();
+  }
+
+  function startPoll(){
+    if(pollTimer)return;
+    pollTimer=setInterval(()=>{if(running)loadList();},3000);
+  }
+  function stopPoll(){
+    clearInterval(pollTimer);
+    pollTimer=null;
+  }
+
+  function statusLabel(cat,item){
+    if(cat==='active')return '⬇ 下载中';
+    if(cat==='waiting')return '⏸ 等待';
+    if(item.errorMessage)return '❌ 错误';
+    return '✅ 完成';
+  }
+
+  function getFilename(item){
+    try{
+      const f=item.files&&item.files[0];
+      if(!f)return '';
+      const p=f.path||f.uris?.[0]?.uri||'';
+      return p.split(/[/\\]/).pop()||p;
+    }catch(e){return '';}
+  }
+
+  function fmtSize(bytes){
+    if(!bytes||bytes<0)return '0 B';
+    const u=['B','KB','MB','GB'];
+    let i=0;
+    while(bytes>=1024&&i<u.length-1){bytes/=1024;i++;}
+    return bytes.toFixed(i>0?1:0)+' '+u[i];
+  }
+  function fmtSpeed(bps){return fmtSize(bps)+'/s'}
+  function escH(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+  function showAddMsg(msg,color){
+    addMsg.textContent=msg;
+    addMsg.style.color=color;
+    addMsg.style.display='block';
+    setTimeout(()=>{addMsg.style.display='none';},4000);
+  }
+
+  // Start polling when running
+  checkStatus().then(()=>{if(running)startPoll();});
 })();
 </script>
 </body>
