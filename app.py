@@ -964,6 +964,25 @@ _aria2_proc = None  # subprocess.Popen handle for the aria2c we spawned
 _ARIA2_RPC_PORT = 6800
 _ARIA2_RPC_SECRET = "ascii_art_tool"
 
+# Mutable config — updated each time aria2 is started
+_aria2_config: dict = {
+    "rpc_port": 6800,
+    "rpc_secret": "ascii_art_tool",
+    "save_dir": "",
+    "max_concurrent": 5,
+    "split": 16,
+    "max_conn_per_server": 16,
+    "min_split_size": "1M",
+    "max_download_limit": "0",
+    "max_upload_limit": "0",
+    "seed_time": 0,
+    "seed_ratio": "1.0",
+    "all_proxy": "",
+    "bt_tracker": "",
+    "allow_overwrite": True,
+    "continue_download": True,
+}
+
 
 def _aria2_rpc(method: str, params=None):
     """Call aria2 JSON-RPC. Returns (result, error)."""
@@ -1001,38 +1020,66 @@ def aria2_status():
     installed = bool(_shutil.which("aria2c"))
     running = _aria2_running()
     return jsonify({"installed": installed, "running": running,
-                    "port": _ARIA2_RPC_PORT})
+                    "port": _aria2_config["rpc_port"],
+                    "config": _aria2_config})
 
 
 @app.route("/aria2-start", methods=["POST"])
 def aria2_start():
-    global _aria2_proc
+    global _aria2_proc, _aria2_config, _ARIA2_RPC_PORT, _ARIA2_RPC_SECRET
     import shutil as _shutil
     if not _shutil.which("aria2c"):
         return jsonify({"error": "未找到 aria2c，请先安装 aria2"}), 400
+
+    # Merge user-supplied config into module config
+    body = request.get_json(silent=True) or {}
+    cfg = body.get("config", {})
+    for k, v in cfg.items():
+        if k in _aria2_config and v != "" and v is not None:
+            _aria2_config[k] = v
+
+    port = int(_aria2_config["rpc_port"])
+    secret = str(_aria2_config["rpc_secret"])
+    _ARIA2_RPC_PORT = port
+    _ARIA2_RPC_SECRET = secret
+
     if _aria2_running():
-        return jsonify({"ok": True, "msg": "aria2 已在运行"})
+        return jsonify({"ok": True, "msg": "aria2 已在运行", "config": _aria2_config})
+
+    args = [
+        "aria2c",
+        "--enable-rpc=true",
+        f"--rpc-listen-port={port}",
+        f"--rpc-secret={secret}",
+        "--rpc-listen-all=false",
+        "--daemon=false",
+        f"--continue={str(_aria2_config['continue_download']).lower()}",
+        f"--max-concurrent-downloads={_aria2_config['max_concurrent']}",
+        f"--split={_aria2_config['split']}",
+        f"--min-split-size={_aria2_config['min_split_size']}",
+        f"--max-connection-per-server={_aria2_config['max_conn_per_server']}",
+        f"--allow-overwrite={str(_aria2_config['allow_overwrite']).lower()}",
+        f"--max-download-limit={_aria2_config['max_download_limit']}",
+        f"--max-upload-limit={_aria2_config['max_upload_limit']}",
+        f"--seed-time={_aria2_config['seed_time']}",
+        f"--seed-ratio={_aria2_config['seed_ratio']}",
+    ]
+    if _aria2_config.get("save_dir"):
+        args.append(f"--dir={_aria2_config['save_dir']}")
+    if _aria2_config.get("all_proxy"):
+        args.append(f"--all-proxy={_aria2_config['all_proxy']}")
+    if _aria2_config.get("bt_tracker"):
+        args.append(f"--bt-tracker={_aria2_config['bt_tracker']}")
+
     try:
-        _aria2_proc = _subprocess.Popen([
-            "aria2c",
-            "--enable-rpc=true",
-            f"--rpc-listen-port={_ARIA2_RPC_PORT}",
-            f"--rpc-secret={_ARIA2_RPC_SECRET}",
-            "--rpc-listen-all=false",
-            "--daemon=false",
-            "--continue=true",
-            "--max-concurrent-downloads=5",
-            "--split=16",
-            "--min-split-size=1M",
-            "--max-connection-per-server=16",
-            "--allow-overwrite=true",
-        ], stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
-        # wait briefly for it to bind
+        _aria2_proc = _subprocess.Popen(
+            args, stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL
+        )
         import time as _time
-        for _ in range(20):
+        for _ in range(30):
             _time.sleep(0.1)
             if _aria2_running():
-                return jsonify({"ok": True, "msg": "aria2 已启动"})
+                return jsonify({"ok": True, "msg": "aria2 已启动", "config": _aria2_config})
         return jsonify({"error": "aria2c 启动超时，请检查端口是否被占用"}), 500
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -1129,6 +1176,35 @@ def aria2_resume():
     if err:
         return jsonify({"error": str(err)}), 500
     return jsonify({"ok": True})
+
+
+@app.route("/aria2-pick-dir", methods=["POST"])
+def aria2_pick_dir():
+    """Open a native folder-picker dialog and return the chosen path."""
+    import threading as _threading
+
+    result = {}
+
+    def _open_dialog():
+        try:
+            import tkinter as _tk
+            from tkinter import filedialog as _fd
+            root = _tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = _fd.askdirectory(title="选择下载目录", parent=root)
+            root.destroy()
+            result["path"] = path or ""
+        except Exception as exc:
+            result["error"] = str(exc)
+
+    t = _threading.Thread(target=_open_dialog, daemon=True)
+    t.start()
+    t.join(timeout=60)
+
+    if "error" in result:
+        return jsonify({"error": result["error"]}), 500
+    return jsonify({"path": result.get("path", "")})
 
 
 @app.route("/qr-generate", methods=["POST"])
@@ -1383,6 +1459,27 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
 .aria2-placeholder-icon{font-size:3rem;opacity:.3}
 .aria2-not-installed{background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3);border-radius:var(--r);padding:12px 14px;font-size:.82rem;color:var(--danger);line-height:1.6}
 .aria2-not-installed code{color:var(--accent);font-size:.8rem}
+/* aria2 main tabs */
+.aria2-main-tabs{border-bottom:1px solid var(--border);padding:0 16px;display:flex;align-items:center;gap:2px;background:var(--surface);flex-shrink:0}
+.aria2-main-tab{padding:9px 14px;font-size:.82rem;font-weight:600;border:none;background:transparent;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;transition:color .15s,border-color .15s;white-space:nowrap}
+.aria2-main-tab:hover{color:var(--text)}
+.aria2-main-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.aria2-tab-count{font-size:.72rem;color:var(--muted);padding:0 4px}
+.aria2-panel{display:none;flex:1;overflow:hidden;flex-direction:column}
+.aria2-panel.active{display:flex}
+/* config panel */
+.aria2-config-scroll{flex:1;overflow-y:auto;padding:16px}
+.aria2-cfg-group{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);margin-bottom:12px;overflow:hidden}
+.aria2-cfg-group-title{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);padding:8px 14px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.02)}
+.aria2-cfg-row{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border)}
+.aria2-cfg-row:last-child{border-bottom:none}
+.aria2-cfg-label{font-size:.8rem;color:var(--muted);flex:1;white-space:nowrap}
+.aria2-cfg-input{padding:5px 10px;border-radius:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);font-size:.82rem;outline:none;width:180px;font-family:inherit}
+.aria2-cfg-input:focus{border-color:var(--accent)}
+.aria2-cfg-input-sm{width:90px}
+.aria2-browse-btn{flex-shrink:0;padding:5px 9px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:.9rem;cursor:pointer;transition:border-color .15s,background .15s;line-height:1}
+.aria2-browse-btn:hover{border-color:var(--accent);background:rgba(88,166,255,.08)}
+.aria2-browse-btn:active{opacity:.7}
 @media(max-width:700px){.aria2-container{grid-template-columns:1fr;grid-template-rows:auto 1fr}.aria2-sidebar{border-right:none;border-bottom:1px solid var(--border)}}
 </style>
 </head>
@@ -1905,6 +2002,7 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
           <input type="text" id="aria2-savedir-input"
             style="flex:1;padding:6px 10px;border-radius:var(--r);background:var(--surface);color:var(--text);border:1px solid var(--border);font-size:.78rem;outline:none"
             placeholder="保存目录（可选）"/>
+          <button class="aria2-browse-btn" id="aria2-savedir-browse" title="浏览目录">📂</button>
         </div>
         <button class="convert-btn" id="aria2-add-btn" disabled style="margin-top:8px">添加到队列</button>
         <p id="aria2-add-msg" style="font-size:.75rem;margin-top:5px;display:none"></p>
@@ -1918,15 +2016,133 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
       </section>
     </div>
     <div class="aria2-main">
-      <div class="aria2-list-header">
-        <span>下载队列</span>
-        <span id="aria2-count" style="color:var(--muted);font-size:.72rem"></span>
-        <button class="refresh-btn" id="aria2-refresh-btn">刷新</button>
+      <!-- Main tab bar -->
+      <div class="aria2-main-tabs">
+        <button class="aria2-main-tab active" data-panel="queue">📋 下载队列</button>
+        <button class="aria2-main-tab" data-panel="config">⚙️ 参数设置</button>
+        <span id="aria2-count" class="aria2-tab-count"></span>
+        <button class="refresh-btn" id="aria2-refresh-btn" style="margin-left:auto">刷新</button>
       </div>
-      <div class="aria2-list" id="aria2-list">
-        <div class="aria2-placeholder" id="aria2-placeholder">
-          <div class="aria2-placeholder-icon">⬇️</div>
-          <p>启动 Aria2 后即可管理下载任务</p>
+
+      <!-- Queue panel -->
+      <div class="aria2-panel active" id="aria2-panel-queue">
+        <div class="aria2-list" id="aria2-list">
+          <div class="aria2-placeholder" id="aria2-placeholder">
+            <div class="aria2-placeholder-icon">⬇️</div>
+            <p>启动 Aria2 后即可管理下载任务</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Config panel -->
+      <div class="aria2-panel" id="aria2-panel-config">
+        <div class="aria2-config-scroll">
+
+          <div class="aria2-cfg-group">
+            <div class="aria2-cfg-group-title">🔌 RPC 连接</div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">监听端口</label>
+              <input class="aria2-cfg-input" id="cfg-rpc-port" type="number" min="1024" max="65535" value="6800" placeholder="6800"/>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">RPC 密钥</label>
+              <input class="aria2-cfg-input" id="cfg-rpc-secret" type="text" value="ascii_art_tool" placeholder="留空则不鉴权"/>
+            </div>
+          </div>
+
+          <div class="aria2-cfg-group">
+            <div class="aria2-cfg-group-title">📁 存储</div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">默认保存目录</label>
+              <div style="display:flex;gap:5px;align-items:center">
+                <input class="aria2-cfg-input" id="cfg-save-dir" type="text" placeholder="留空使用 aria2 默认目录"/>
+                <button class="aria2-browse-btn" id="cfg-save-dir-browse" title="浏览目录">📂</button>
+              </div>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">覆盖已有文件</label>
+              <label class="toggle" style="margin-left:auto">
+                <input type="checkbox" id="cfg-allow-overwrite" checked/>
+                <div class="toggle-track"></div><div class="toggle-thumb"></div>
+              </label>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">断点续传</label>
+              <label class="toggle" style="margin-left:auto">
+                <input type="checkbox" id="cfg-continue" checked/>
+                <div class="toggle-track"></div><div class="toggle-thumb"></div>
+              </label>
+            </div>
+          </div>
+
+          <div class="aria2-cfg-group">
+            <div class="aria2-cfg-group-title">⚡ 速度限制</div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">下载限速</label>
+              <input class="aria2-cfg-input" id="cfg-dl-limit" type="text" value="0" placeholder="0=不限，支持 K/M，如 10M"/>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">上传限速</label>
+              <input class="aria2-cfg-input" id="cfg-ul-limit" type="text" value="0" placeholder="0=不限，如 512K"/>
+            </div>
+          </div>
+
+          <div class="aria2-cfg-group">
+            <div class="aria2-cfg-group-title">🔗 连接与分段</div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">最大并发下载数</label>
+              <input class="aria2-cfg-input aria2-cfg-input-sm" id="cfg-max-concurrent" type="number" min="1" max="20" value="5"/>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">单文件分段数</label>
+              <input class="aria2-cfg-input aria2-cfg-input-sm" id="cfg-split" type="number" min="1" max="64" value="16"/>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">单服务器最大连接</label>
+              <input class="aria2-cfg-input aria2-cfg-input-sm" id="cfg-max-conn" type="number" min="1" max="16" value="16"/>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">最小分段大小</label>
+              <input class="aria2-cfg-input aria2-cfg-input-sm" id="cfg-min-split" type="text" value="1M" placeholder="如 1M、512K"/>
+            </div>
+          </div>
+
+          <div class="aria2-cfg-group">
+            <div class="aria2-cfg-group-title">🧲 BT / 磁力</div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">最大做种时间（分钟）</label>
+              <input class="aria2-cfg-input aria2-cfg-input-sm" id="cfg-seed-time" type="number" min="0" value="0" placeholder="0=关闭做种"/>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">做种比例</label>
+              <input class="aria2-cfg-input aria2-cfg-input-sm" id="cfg-seed-ratio" type="text" value="1.0" placeholder="如 1.0"/>
+            </div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">自定义 Tracker</label>
+              <textarea class="aria2-cfg-input" id="cfg-bt-tracker" rows="2"
+                style="resize:vertical;min-height:50px"
+                placeholder="多个 Tracker 用逗号分隔"></textarea>
+            </div>
+          </div>
+
+          <div class="aria2-cfg-group">
+            <div class="aria2-cfg-group-title">🌐 代理</div>
+            <div class="aria2-cfg-row">
+              <label class="aria2-cfg-label">HTTP/SOCKS 代理</label>
+              <input class="aria2-cfg-input" id="cfg-proxy" type="text" placeholder="如 http://127.0.0.1:7890"/>
+            </div>
+          </div>
+
+          <div style="padding:0 4px 16px">
+            <p id="aria2-cfg-save-msg" style="font-size:.75rem;margin-bottom:8px;display:none"></p>
+            <button class="convert-btn" id="aria2-cfg-save-btn" style="width:100%">
+              保存并重启 Aria2
+            </button>
+            <p style="font-size:.7rem;color:var(--muted);margin-top:6px;text-align:center">
+              仅在 Aria2 运行时重启生效；未运行时保存供下次启动使用
+            </p>
+          </div>
+
         </div>
       </div>
     </div>
@@ -3001,12 +3217,96 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
   const placeholder= $('aria2-placeholder');
   const countEl    = $('aria2-count');
   const refreshBtn = $('aria2-refresh-btn');
+  const cfgSaveBtn     = $('aria2-cfg-save-btn');
+  const cfgSaveMsg     = $('aria2-cfg-save-msg');
+  const saveirdBrowse  = $('aria2-savedir-browse');
+  const cfgDirBrowse   = $('cfg-save-dir-browse');
 
   let running = false;
   let installed = false;
   let pollTimer = null;
 
-  // Check status when tab clicked
+  // ── Directory browser ────────────────────────────────
+  async function pickDir(targetInput){
+    const btn = targetInput === $('aria2-savedir-input') ? saveirdBrowse : cfgDirBrowse;
+    const orig = btn.textContent;
+    btn.textContent = '…';
+    btn.disabled = true;
+    try{
+      const d = await fetch('/aria2-pick-dir',{method:'POST'}).then(r=>r.json());
+      if(d.path) targetInput.value = d.path;
+      else if(d.error) console.warn('pick-dir error:', d.error);
+    }catch(e){}
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+
+  saveirdBrowse.addEventListener('click', ()=> pickDir($('aria2-savedir-input')));
+  cfgDirBrowse.addEventListener('click',  ()=> pickDir($('cfg-save-dir')));
+
+  // ── Main panel tab switching ──────────────────────────
+  document.querySelectorAll('.aria2-main-tab').forEach(tab=>{
+    tab.addEventListener('click',()=>{
+      document.querySelectorAll('.aria2-main-tab').forEach(t=>t.classList.remove('active'));
+      document.querySelectorAll('.aria2-panel').forEach(p=>p.classList.remove('active'));
+      tab.classList.add('active');
+      $('aria2-panel-'+tab.dataset.panel).classList.add('active');
+    });
+  });
+
+  // ── Config fields helpers ─────────────────────────────
+  const cfgFields = {
+    rpc_port:          ()=>parseInt($('cfg-rpc-port').value)||6800,
+    rpc_secret:        ()=>$('cfg-rpc-secret').value.trim(),
+    save_dir:          ()=>$('cfg-save-dir').value.trim(),
+    allow_overwrite:   ()=>$('cfg-allow-overwrite').checked,
+    continue_download: ()=>$('cfg-continue').checked,
+    max_download_limit:()=>$('cfg-dl-limit').value.trim()||'0',
+    max_upload_limit:  ()=>$('cfg-ul-limit').value.trim()||'0',
+    max_concurrent:    ()=>parseInt($('cfg-max-concurrent').value)||5,
+    split:             ()=>parseInt($('cfg-split').value)||16,
+    max_conn_per_server:()=>parseInt($('cfg-max-conn').value)||16,
+    min_split_size:    ()=>$('cfg-min-split').value.trim()||'1M',
+    seed_time:         ()=>parseInt($('cfg-seed-time').value)||0,
+    seed_ratio:        ()=>$('cfg-seed-ratio').value.trim()||'1.0',
+    bt_tracker:        ()=>$('cfg-bt-tracker').value.trim(),
+    all_proxy:         ()=>$('cfg-proxy').value.trim(),
+  };
+
+  function readConfig(){
+    const cfg={};
+    for(const[k,fn] of Object.entries(cfgFields)) cfg[k]=fn();
+    return cfg;
+  }
+
+  function applyConfig(cfg){
+    if(!cfg)return;
+    if(cfg.rpc_port)    $('cfg-rpc-port').value=cfg.rpc_port;
+    if(cfg.rpc_secret!=null) $('cfg-rpc-secret').value=cfg.rpc_secret;
+    if(cfg.save_dir!=null)   $('cfg-save-dir').value=cfg.save_dir;
+    $('cfg-allow-overwrite').checked=cfg.allow_overwrite!==false;
+    $('cfg-continue').checked=cfg.continue_download!==false;
+    if(cfg.max_download_limit!=null) $('cfg-dl-limit').value=cfg.max_download_limit;
+    if(cfg.max_upload_limit!=null)   $('cfg-ul-limit').value=cfg.max_upload_limit;
+    if(cfg.max_concurrent)   $('cfg-max-concurrent').value=cfg.max_concurrent;
+    if(cfg.split)            $('cfg-split').value=cfg.split;
+    if(cfg.max_conn_per_server) $('cfg-max-conn').value=cfg.max_conn_per_server;
+    if(cfg.min_split_size)   $('cfg-min-split').value=cfg.min_split_size;
+    if(cfg.seed_time!=null)  $('cfg-seed-time').value=cfg.seed_time;
+    if(cfg.seed_ratio!=null) $('cfg-seed-ratio').value=cfg.seed_ratio;
+    if(cfg.bt_tracker!=null) $('cfg-bt-tracker').value=cfg.bt_tracker;
+    if(cfg.all_proxy!=null)  $('cfg-proxy').value=cfg.all_proxy;
+  }
+
+  // Persist config to localStorage
+  function saveLocalConfig(cfg){
+    try{localStorage.setItem('aria2_config',JSON.stringify(cfg));}catch(e){}
+  }
+  function loadLocalConfig(){
+    try{return JSON.parse(localStorage.getItem('aria2_config')||'null');}catch(e){return null;}
+  }
+
+  // ── Check status when tab clicked ─────────────────────
   document.querySelector('[data-tab="aria2"]').addEventListener('click', checkStatus);
 
   async function checkStatus(){
@@ -3014,6 +3314,10 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
       const d = await fetch('/aria2-status').then(r=>r.json());
       installed = d.installed;
       running = d.running;
+      // Apply server config to UI (or fall back to localStorage)
+      const serverCfg = d.config || {};
+      const localCfg  = loadLocalConfig() || {};
+      applyConfig({...localCfg, ...serverCfg});
       updateUI();
       if(running) loadList();
     }catch(e){}
@@ -3033,8 +3337,9 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
     notInstall.style.display='none';
     powerBtn.disabled=false;
     if(running){
+      const port=$('cfg-rpc-port').value||6800;
       dot.className='aria2-status-dot on';
-      statusTxt.textContent='运行中（端口 6800）';
+      statusTxt.textContent=`运行中（端口 ${port}）`;
       powerBtn.textContent='停止 Aria2';
       powerBtn.className='aria2-power-btn on';
       addBtn.disabled=false;
@@ -3044,6 +3349,33 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
       powerBtn.textContent='启动 Aria2';
       powerBtn.className='aria2-power-btn off';
       addBtn.disabled=true;
+    }
+  }
+
+  // ── Start / Stop ──────────────────────────────────────
+  async function doStart(){
+    statusTxt.textContent='正在启动…';
+    const cfg=readConfig();
+    saveLocalConfig(cfg);
+    try{
+      const d=await fetch('/aria2-start',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({config:cfg})
+      }).then(r=>r.json());
+      if(d.error){
+        statusTxt.textContent='启动失败：'+d.error;
+        running=false;
+      }else{
+        running=true;
+        loadList();
+        startPoll();
+        // Switch to queue panel after start
+        document.querySelector('.aria2-main-tab[data-panel="queue"]').click();
+      }
+    }catch(e){
+      statusTxt.textContent='启动失败';
+      running=false;
     }
   }
 
@@ -3059,25 +3391,39 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
       placeholder.style.display='flex';
       countEl.textContent='';
     }else{
-      statusTxt.textContent='正在启动…';
-      try{
-        const d = await fetch('/aria2-start',{method:'POST'}).then(r=>r.json());
-        if(d.error){
-          statusTxt.textContent='启动失败：'+d.error;
-          running=false;
-        }else{
-          running=true;
-          loadList();
-          startPoll();
-        }
-      }catch(e){
-        statusTxt.textContent='启动失败';
-        running=false;
-      }
+      await doStart();
     }
     updateUI();
   });
 
+  // ── Config save & restart ─────────────────────────────
+  cfgSaveBtn.addEventListener('click', async()=>{
+    const cfg=readConfig();
+    saveLocalConfig(cfg);
+    if(!running){
+      showCfgMsg('设置已保存，下次启动生效','var(--green)');
+      return;
+    }
+    cfgSaveBtn.disabled=true;
+    showCfgMsg('重启中…','var(--muted)');
+    await fetch('/aria2-stop',{method:'POST'});
+    running=false;
+    stopPoll();
+    await doStart();
+    updateUI();
+    cfgSaveBtn.disabled=false;
+    if(running) showCfgMsg('已重启，新配置生效','var(--green)');
+    else showCfgMsg('重启失败，请检查参数','var(--danger)');
+  });
+
+  function showCfgMsg(msg,color){
+    cfgSaveMsg.textContent=msg;
+    cfgSaveMsg.style.color=color;
+    cfgSaveMsg.style.display='block';
+    setTimeout(()=>{cfgSaveMsg.style.display='none';},4000);
+  }
+
+  // ── Add download ──────────────────────────────────────
   addBtn.addEventListener('click', async()=>{
     const raw=urlInput.value.trim();
     if(!raw){showAddMsg('请输入下载链接','var(--danger)');return;}
@@ -3103,6 +3449,7 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
 
   refreshBtn.addEventListener('click',()=>loadList());
 
+  // ── Download list ─────────────────────────────────────
   async function loadList(){
     if(!running)return;
     try{
@@ -3127,7 +3474,7 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
       return;
     }
     placeholder.style.display='none';
-    countEl.textContent=`共 ${all.length} 个任务（活动 ${data.active.length}）`;
+    countEl.textContent=`${data.active.length} 活动 / ${all.length} 总计`;
     const frag=document.createDocumentFragment();
     all.forEach(item=>{
       const el=buildItem(item);
@@ -3144,7 +3491,6 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
     const speed=parseInt(item.downloadSpeed)||0;
     const cat=item._cat;
     const name=getFilename(item)||item.gid;
-
     const barClass=cat==='active'?'active':(cat==='stopped'&&!item.errorMessage)?'complete':'error';
 
     const el=document.createElement('div');
@@ -3158,6 +3504,7 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
         <span>${pct}%</span>
         <span>${fmtSize(done)} / ${fmtSize(total)}</span>
         ${cat==='active'?`<span>↓ ${fmtSpeed(speed)}</span>`:''}
+        ${item.errorMessage?`<span style="color:var(--danger);flex:1;overflow:hidden;text-overflow:ellipsis" title="${escH(item.errorMessage)}">${escH(item.errorMessage)}</span>`:''}
       </div>
       <div class="aria2-item-actions">
         ${cat==='active'?`<button class="aria2-act-btn" data-act="pause">暂停</button>`:''}
@@ -3180,10 +3527,7 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
     if(pollTimer)return;
     pollTimer=setInterval(()=>{if(running)loadList();},3000);
   }
-  function stopPoll(){
-    clearInterval(pollTimer);
-    pollTimer=null;
-  }
+  function stopPoll(){clearInterval(pollTimer);pollTimer=null;}
 
   function statusLabel(cat,item){
     if(cat==='active')return '⬇ 下载中';
@@ -3211,13 +3555,13 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
   function fmtSpeed(bps){return fmtSize(bps)+'/s'}
   function escH(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
   function showAddMsg(msg,color){
-    addMsg.textContent=msg;
-    addMsg.style.color=color;
-    addMsg.style.display='block';
+    addMsg.textContent=msg;addMsg.style.color=color;addMsg.style.display='block';
     setTimeout(()=>{addMsg.style.display='none';},4000);
   }
 
-  // Start polling when running
+  // Init: load local config first, then check server
+  const localCfg=loadLocalConfig();
+  if(localCfg) applyConfig(localCfg);
   checkStatus().then(()=>{if(running)startPoll();});
 })();
 </script>
