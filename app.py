@@ -18,72 +18,118 @@ except ImportError:
     from flask import Flask, request, jsonify, render_template_string, send_file
     from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-try:
-    # audioop-lts provides the audioop module removed in Python 3.13+
-    import audioop  # noqa: F401
-except ModuleNotFoundError:
-    try:
-        import subprocess
-        subprocess.run([sys.executable, "-m", "pip", "install", "audioop-lts", "-q"])
-        import audioop  # noqa: F401
-    except Exception:
-        pass
+import subprocess
 
-try:
-    from pydub import AudioSegment
-    PYDUB_OK = True
-except ImportError:
+# ── Optional feature flags (lazy-loaded on first use) ─────────────────────────
+PYDUB_OK = False
+PYZBAR_OK = False
+QRCODE_OK = False
+REQUESTS_OK = False
+PLAYWRIGHT_OK = False
+
+AudioSegment = None
+_pyzbar = None
+_qrcode = None
+_requests = None
+_BS = None
+_sync_playwright = None
+
+
+def _ensure_pydub() -> bool:
+    global PYDUB_OK, AudioSegment
+    if AudioSegment is not None:
+        return True
     try:
-        import subprocess
-        subprocess.run([sys.executable, "-m", "pip", "install", "pydub", "audioop-lts", "-q"])
-        from pydub import AudioSegment
+        try:
+            import audioop  # noqa: F401
+        except ModuleNotFoundError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "audioop-lts", "-q"])
+        from pydub import AudioSegment as _AS
+        AudioSegment = _AS
         PYDUB_OK = True
     except Exception:
-        PYDUB_OK = False
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "pydub", "audioop-lts", "-q"])
+            from pydub import AudioSegment as _AS
+            AudioSegment = _AS
+            PYDUB_OK = True
+        except Exception:
+            PYDUB_OK = False
+    return PYDUB_OK
 
-try:
-    from pyzbar import pyzbar as _pyzbar
-    PYZBAR_OK = True
-except ImportError:
+
+def _ensure_pyzbar() -> bool:
+    global PYZBAR_OK, _pyzbar
+    if _pyzbar is not None:
+        return True
     try:
-        import subprocess
-        subprocess.run([sys.executable, "-m", "pip", "install", "pyzbar", "-q"])
-        from pyzbar import pyzbar as _pyzbar
+        from pyzbar import pyzbar as pz
+        _pyzbar = pz
         PYZBAR_OK = True
-    except Exception:
-        PYZBAR_OK = False
+    except ImportError:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "pyzbar", "-q"])
+            from pyzbar import pyzbar as pz
+            _pyzbar = pz
+            PYZBAR_OK = True
+        except Exception:
+            PYZBAR_OK = False
+    return PYZBAR_OK
 
-try:
-    import qrcode as _qrcode
-    QRCODE_OK = True
-except ImportError:
+
+def _ensure_qrcode() -> bool:
+    global QRCODE_OK, _qrcode
+    if _qrcode is not None:
+        return True
     try:
-        import subprocess
-        subprocess.run([sys.executable, "-m", "pip", "install", "qrcode[pil]", "-q"])
-        import qrcode as _qrcode
+        import qrcode as qc
+        _qrcode = qc
         QRCODE_OK = True
-    except Exception:
-        QRCODE_OK = False
+    except ImportError:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "qrcode[pil]", "-q"])
+            import qrcode as qc
+            _qrcode = qc
+            QRCODE_OK = True
+        except Exception:
+            QRCODE_OK = False
+    return QRCODE_OK
 
-try:
-    import requests as _requests
-    from bs4 import BeautifulSoup as _BS
-    REQUESTS_OK = True
-except ImportError:
+
+def _ensure_requests() -> bool:
+    global REQUESTS_OK, _requests, _BS
+    if _requests is not None:
+        return True
     try:
-        import subprocess
-        subprocess.run([sys.executable, "-m", "pip", "install", "requests", "beautifulsoup4", "lxml", "-q"])
-        import requests as _requests
-        from bs4 import BeautifulSoup as _BS
+        import requests as req
+        from bs4 import BeautifulSoup as BS
+        _requests = req
+        _BS = BS
         REQUESTS_OK = True
-    except Exception:
-        REQUESTS_OK = False
+    except ImportError:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "requests", "beautifulsoup4", "lxml", "-q"])
+            import requests as req
+            from bs4 import BeautifulSoup as BS
+            _requests = req
+            _BS = BS
+            REQUESTS_OK = True
+        except Exception:
+            REQUESTS_OK = False
+    return REQUESTS_OK
 
-try:
-    from playwright.sync_api import sync_playwright as _sync_playwright
-    PLAYWRIGHT_OK = True
-except ImportError:
-    PLAYWRIGHT_OK = False
+
+def _ensure_playwright() -> bool:
+    global PLAYWRIGHT_OK, _sync_playwright
+    if _sync_playwright is not None:
+        return True
+    try:
+        from playwright.sync_api import sync_playwright as sp
+        _sync_playwright = sp
+        PLAYWRIGHT_OK = True
+    except ImportError:
+        PLAYWRIGHT_OK = False
+    return PLAYWRIGHT_OK
 
 import base64
 
@@ -327,7 +373,7 @@ _SRC_FMT_MAP = {"m4a": "mp4", "aac": "adts"}
 
 @app.route("/audio-check", methods=["GET"])
 def audio_check():
-    if not PYDUB_OK:
+    if not _ensure_pydub():
         return jsonify({"ok": False, "reason": "pydub 未安装"})
     import shutil
     ffmpeg = shutil.which("ffmpeg")
@@ -338,7 +384,7 @@ def audio_check():
 
 @app.route("/audio-convert", methods=["POST"])
 def audio_convert():
-    if not PYDUB_OK:
+    if not _ensure_pydub():
         return jsonify({"error": "pydub 未安装，请运行 pip install pydub"}), 500
     import shutil
     if not shutil.which("ffmpeg"):
@@ -656,12 +702,12 @@ def _codes_to_css(codes):
 
 @app.route("/qr-check", methods=["GET"])
 def qr_check():
-    return jsonify({"pyzbar": PYZBAR_OK, "qrcode": QRCODE_OK})
+    return jsonify({"pyzbar": _ensure_pyzbar(), "qrcode": _ensure_qrcode()})
 
 
 @app.route("/qr-scan", methods=["POST"])
 def qr_scan():
-    if not PYZBAR_OK:
+    if not _ensure_pyzbar():
         return jsonify({"error": "需要安装 pyzbar：pip install pyzbar"}), 400
     file = request.files.get("file")
     if not file:
@@ -855,8 +901,8 @@ def _grab_with_playwright(url: str) -> tuple[list[dict], str]:
 @app.route("/imgrab-check", methods=["GET"])
 def imgrab_check():
     return jsonify({
-        "requests_ok": REQUESTS_OK,
-        "playwright_ok": PLAYWRIGHT_OK,
+        "requests_ok": _ensure_requests(),
+        "playwright_ok": _ensure_playwright(),
     })
 
 
@@ -871,12 +917,12 @@ def img_grab():
         url = "https://" + url
     try:
         if use_browser:
-            if not PLAYWRIGHT_OK:
+            if not _ensure_playwright():
                 return jsonify({"error": "Playwright 未安装，请运行：pip install playwright && playwright install chromium"}), 400
             images, final_url = _grab_with_playwright(url)
             method = "playwright"
         else:
-            if not REQUESTS_OK:
+            if not _ensure_requests():
                 return jsonify({"error": "requests/beautifulsoup4 未安装"}), 400
             images, final_url = _grab_with_requests(url)
             method = "requests"
@@ -892,7 +938,7 @@ def img_proxy():
     if not img_url or not img_url.startswith("http"):
         return jsonify({"error": "无效链接"}), 400
     try:
-        if REQUESTS_OK:
+        if _ensure_requests():
             resp = _make_session().get(img_url, timeout=12, stream=True)
             resp.raise_for_status()
             ct = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
@@ -917,7 +963,7 @@ def img_download_zip():
     if not urls:
         return jsonify({"error": "未选择图片"}), 400
 
-    sess = _make_session() if REQUESTS_OK else None
+    sess = _make_session() if _ensure_requests() else None
     buf = io.BytesIO()
     seen_names: dict[str, int] = {}
 
@@ -1209,7 +1255,7 @@ def aria2_pick_dir():
 
 @app.route("/qr-generate", methods=["POST"])
 def qr_generate():
-    if not QRCODE_OK:
+    if not _ensure_qrcode():
         return jsonify({"error": "需要安装 qrcode：pip install qrcode[pil]"}), 400
     body = request.get_json(silent=True) or {}
     text = body.get("text", "").strip()
@@ -1228,6 +1274,34 @@ def qr_generate():
         return jsonify({"error": str(exc)}), 500
 
 
+# \u2500\u2500 QQ Chat Exporter (NapCat API) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+@app.route("/bing-wallpaper", methods=["GET"])
+def bing_wallpaper():
+    if not _ensure_requests():
+        return jsonify({"error": "requests 库未安装"}), 500
+    try:
+        idx = request.args.get("idx", 0, type=int)
+        n   = min(request.args.get("n", 8, type=int), 16)
+        mkt = request.args.get("mkt", "zh-CN")
+        url = f"https://www.bing.com/HPImageArchive.aspx?format=js&idx={idx}&n={n}&mkt={mkt}"
+        resp = _requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        data = resp.json()
+        images = []
+        for img in data.get("images", []):
+            base = img.get("urlbase", "")
+            images.append({
+                "title":     img.get("title", ""),
+                "copyright": img.get("copyright", ""),
+                "date":      img.get("startdate", ""),
+                "url":       f"https://www.bing.com{base}_1920x1080.jpg",
+                "thumb":     f"https://www.bing.com{base}_640x360.jpg",
+            })
+        return jsonify({"images": images})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 # ── Embedded HTML ─────────────────────────────────────────────────────────────
 
 _HTML = r"""<!DOCTYPE html>
@@ -1239,6 +1313,9 @@ _HTML = r"""<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--accent:#58a6ff;--green:#3fb950;--text:#e6edf3;--muted:#8b949e;--danger:#f85149;--r:8px}
+html[data-theme="light"]{--bg:#ffffff;--surface:#f6f8fa;--border:#d0d7de;--accent:#0969da;--green:#1a7f37;--text:#1f2328;--muted:#57606a;--danger:#cf222e}
+.theme-btn{padding:5px 10px;font-size:1rem;line-height:1;border:1px solid var(--border);border-radius:var(--r);background:var(--surface);color:var(--text);cursor:pointer;transition:border-color .15s,background .15s;flex-shrink:0}
+.theme-btn:hover{border-color:var(--accent)}
 body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column}
 header{border-bottom:1px solid var(--border);padding:13px 20px;display:flex;align-items:center;gap:10px}
 header h1{font-size:1rem;font-weight:600}
@@ -1481,6 +1558,30 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
 .aria2-browse-btn:hover{border-color:var(--accent);background:rgba(88,166,255,.08)}
 .aria2-browse-btn:active{opacity:.7}
 @media(max-width:700px){.aria2-container{grid-template-columns:1fr;grid-template-rows:auto 1fr}.aria2-sidebar{border-right:none;border-bottom:1px solid var(--border)}}
+/* ── Bing Wallpaper ── */
+.bing-container{display:flex;flex-direction:column;flex:1;overflow:hidden}
+.bing-toolbar{border-bottom:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--surface)}
+.bing-select{padding:6px 10px;border-radius:var(--r);background:var(--surface);color:var(--text);border:1px solid var(--border);font-size:.82rem;outline:none;cursor:pointer}
+.bing-select:focus{border-color:var(--accent)}
+.bing-grid{flex:1;overflow-y:auto;padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;align-content:start;background:var(--bg)}
+.bing-card{border:1px solid var(--border);border-radius:var(--r);overflow:hidden;background:var(--surface);transition:border-color .15s,transform .15s;cursor:pointer}
+.bing-card:hover{border-color:var(--accent);transform:translateY(-2px)}
+.bing-thumb-link{display:block}.bing-thumb{width:100%;height:160px;object-fit:cover;display:block;background:var(--border)}
+.bing-card-body{padding:10px 12px}
+.bing-card-title{font-size:.85rem;font-weight:600;color:var(--text);margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bing-card-copy{font-size:.72rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bing-card-date{font-size:.7rem;color:var(--muted);margin-top:4px}
+.bing-card-actions{display:flex;gap:6px;margin-top:8px}
+.bing-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);height:100%;grid-column:1/-1}
+/* lightbox */
+.bing-lb{display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:1000;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:20px}
+.bing-lb.open{display:flex}
+.bing-lb-img{max-width:90vw;max-height:75vh;border-radius:var(--r);border:1px solid var(--border);object-fit:contain}
+.bing-lb-title{font-size:1rem;font-weight:600;color:#fff;text-align:center;max-width:800px}
+.bing-lb-copy{font-size:.82rem;color:rgba(255,255,255,.6);text-align:center;max-width:700px}
+.bing-lb-actions{display:flex;gap:10px}
+.bing-lb-close{position:absolute;top:14px;right:18px;font-size:1.5rem;color:#fff;background:none;border:none;cursor:pointer;opacity:.7;line-height:1}
+.bing-lb-close:hover{opacity:1}
 </style>
 </head>
 <body>
@@ -1496,8 +1597,10 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
       <button class="nav-tab" data-tab="qr">📷 二维码</button>
       <button class="nav-tab" data-tab="imgrab">🖼️ 图片抓取</button>
       <button class="nav-tab" data-tab="aria2">⬇️ Aria2</button>
+      <button class="nav-tab" data-tab="bing">🌄 必应壁纸</button>
     </nav>
   </div>
+  <button class="theme-btn" id="theme-toggle" title="切换主题">🌙</button>
   <span class="badge">v2.5</span>
 </header>
 
@@ -2149,8 +2252,78 @@ audio{width:100%;margin-bottom:16px;accent-color:var(--accent)}
   </div>
 </div>
 
+
+<!-- Bing Wallpaper Module -->
+<div id="module-bing" class="module">
+  <div class="module-header">
+    <h2>🌄 必应每日壁纸</h2>
+    <p class="module-desc">获取必应每日精选壁纸，支持预览和下载高清原图</p>
+  </div>
+  <div class="bing-container">
+    <div class="bing-toolbar">
+      <select id="bing-mkt" class="bing-select" title="语言/地区">
+        <option value="zh-CN">中文（简体）</option>
+        <option value="zh-TW">中文（繁体）</option>
+        <option value="en-US">English (US)</option>
+        <option value="ja-JP">日本語</option>
+        <option value="de-DE">Deutsch</option>
+        <option value="fr-FR">Français</option>
+      </select>
+      <select id="bing-count" class="bing-select" title="获取数量">
+        <option value="4">4 张</option>
+        <option value="8" selected>8 张</option>
+        <option value="16">16 张</option>
+      </select>
+      <button class="convert-btn" id="bing-fetch-btn" style="width:auto;padding:7px 18px;font-size:.82rem">获取壁纸</button>
+      <span id="bing-status" style="font-size:.78rem;color:var(--muted)"></span>
+    </div>
+    <div class="bing-grid" id="bing-grid">
+      <div class="bing-placeholder" id="bing-placeholder">
+        <div style="font-size:3rem;opacity:.3">🌄</div>
+        <p>点击「获取壁纸」加载必应每日壁纸</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Bing Lightbox -->
+<div class="bing-lb" id="bing-lb">
+  <button class="bing-lb-close" id="bing-lb-close">✕</button>
+  <img class="bing-lb-img" id="bing-lb-img" src="" alt=""/>
+  <div class="bing-lb-title" id="bing-lb-title"></div>
+  <div class="bing-lb-copy" id="bing-lb-copy"></div>
+  <div class="bing-lb-actions">
+    <button class="convert-btn" id="bing-lb-dl" style="width:auto;padding:8px 20px">⬇ 下载原图</button>
+    <button class="btn-sm" id="bing-lb-copy-url">复制链接</button>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
+
+// ── Theme Toggle ─────────────────────────────────────
+(function(){
+  const saved = localStorage.getItem('theme') || 'dark';
+  if(saved === 'light') document.documentElement.setAttribute('data-theme','light');
+  const btn = document.getElementById('theme-toggle');
+  function updateBtn(){
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    btn.textContent = isLight ? '☀️' : '🌙';
+    btn.title = isLight ? '切换到深色主题' : '切换到浅色主题';
+  }
+  updateBtn();
+  btn.addEventListener('click',()=>{
+    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+    if(isLight){
+      document.documentElement.removeAttribute('data-theme');
+      localStorage.setItem('theme','dark');
+    } else {
+      document.documentElement.setAttribute('data-theme','light');
+      localStorage.setItem('theme','light');
+    }
+    updateBtn();
+  });
+})();
 
 // ── Navigation ───────────────────────────────────────
 document.querySelectorAll('.nav-tab').forEach(tab=>{
@@ -3564,6 +3737,121 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
   if(localCfg) applyConfig(localCfg);
   checkStatus().then(()=>{if(running)startPoll();});
 })();
+
+// ═════════════════════════════════════════════════════
+
+// ── Bing Wallpaper ────────────────────────────────────
+(function(){
+  const grid       = $('bing-grid');
+  const placeholder= $('bing-placeholder');
+  const fetchBtn   = $('bing-fetch-btn');
+  const statusEl   = $('bing-status');
+  const mktSel     = $('bing-mkt');
+  const countSel   = $('bing-count');
+  const lb         = $('bing-lb');
+  const lbImg      = $('bing-lb-img');
+  const lbTitle    = $('bing-lb-title');
+  const lbCopy     = $('bing-lb-copy');
+  const lbDl       = $('bing-lb-dl');
+  const lbCopyUrl  = $('bing-lb-copy-url');
+  const lbClose    = $('bing-lb-close');
+
+  let currentUrl = '';
+
+  fetchBtn.addEventListener('click', fetchWallpapers);
+
+  function fetchWallpapers() {
+    fetchBtn.disabled = true;
+    fetchBtn.textContent = '加载中…';
+    statusEl.textContent = '';
+    const mkt   = mktSel.value;
+    const n     = countSel.value;
+    fetch(`/bing-wallpaper?n=${n}&mkt=${encodeURIComponent(mkt)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) { statusEl.textContent = '错误：' + data.error; return; }
+        renderCards(data.images || []);
+        statusEl.textContent = `已加载 ${(data.images||[]).length} 张`;
+      })
+      .catch(err => { statusEl.textContent = '请求失败：' + err; })
+      .finally(() => { fetchBtn.disabled = false; fetchBtn.textContent = '获取壁纸'; });
+  }
+
+  function renderCards(images) {
+    // clear everything except placeholder
+    Array.from(grid.children).forEach(el => { if(el !== placeholder) el.remove(); });
+    if (!images.length) { placeholder.style.display = 'flex'; return; }
+    placeholder.style.display = 'none';
+    images.forEach(img => {
+      const card = document.createElement('div');
+      card.className = 'bing-card';
+      const dateStr = img.date ? img.date.replace(/(\d{4})(\d{2})(\d{2})/,'$1-$2-$3') : '';
+      card.innerHTML =
+        `<a class="bing-thumb-link" href="${escAttr(img.url)}" target="_blank">` +
+          `<img class="bing-thumb" src="${escAttr(img.thumb)}" alt="${escAttr(img.title)}" loading="lazy"/>` +
+        `</a>` +
+        `<div class="bing-card-body">` +
+          `<div class="bing-card-title">${escH(img.title || '(无标题)')}</div>` +
+          `<div class="bing-card-copy">${escH(img.copyright || '')}</div>` +
+          `<div class="bing-card-date">${dateStr}</div>` +
+          `<div class="bing-card-actions">` +
+            `<button class="convert-btn" style="flex:1;padding:5px;font-size:.75rem" data-action="preview">预览</button>` +
+            `<button class="btn-sm" data-action="dl">下载</button>` +
+          `</div>` +
+        `</div>`;
+      card.querySelector('[data-action="preview"]').addEventListener('click', () => openLb(img));
+      card.querySelector('[data-action="dl"]').addEventListener('click', () => downloadImg(img.url, img.title));
+      card.querySelector('.bing-thumb-link').addEventListener('click', e => {
+        if (e.ctrlKey) return; // 让浏览器原生处理：在新标签页打开原图
+        e.preventDefault();
+        openLb(img);
+      });
+      grid.appendChild(card);
+    });
+  }
+
+  function openLb(img) {
+    currentUrl = img.url;
+    lbImg.src = img.url;
+    lbTitle.textContent = img.title || '';
+    lbCopy.textContent  = img.copyright || '';
+    lb.classList.add('open');
+  }
+
+  lbClose.addEventListener('click', () => lb.classList.remove('open'));
+  lb.addEventListener('click', e => { if (e.target === lb) lb.classList.remove('open'); });
+
+  lbDl.addEventListener('click', () => {
+    const a = document.createElement('a');
+    a.href = currentUrl;
+    a.download = (lbTitle.textContent || 'bing-wallpaper') + '.jpg';
+    a.target = '_blank';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  });
+
+  lbCopyUrl.addEventListener('click', () => {
+    navigator.clipboard.writeText(currentUrl).then(() => {
+      const old = lbCopyUrl.textContent;
+      lbCopyUrl.textContent = '已复制！';
+      setTimeout(() => { lbCopyUrl.textContent = old; }, 1500);
+    });
+  });
+
+  function downloadImg(url, title) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (title || 'bing-wallpaper') + '.jpg';
+    a.target = '_blank';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  function escH(s)    { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function escAttr(s) { return String(s).replace(/"/g,'&quot;'); }
+})();
 </script>
 </body>
 </html>"""
@@ -3571,9 +3859,22 @@ pickerColorRgb.addEventListener('click',()=>pickerColorRgb.select());
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _open_when_ready(url: str, port: int) -> None:
+    """Wait until Flask is accepting connections, then open the browser."""
+    import socket, time
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("localhost", port), timeout=0.1):
+                break
+        except OSError:
+            time.sleep(0.05)
+    webbrowser.open(url)
+
+
 if __name__ == "__main__":
     PORT = 8899
     url  = f"http://localhost:{PORT}"
     print(f"ASCII Art  ->  {url}")
-    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    threading.Thread(target=_open_when_ready, args=(url, PORT), daemon=True).start()
     app.run(port=PORT, debug=False)
